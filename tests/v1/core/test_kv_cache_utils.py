@@ -807,6 +807,46 @@ def _stats(requests: int, queries: int, hits: int) -> PrefixCacheStats:
     return PrefixCacheStats(requests=requests, queries=queries, hits=hits)
 
 
+def test_prefix_cache_stats_routes_preempted_separately():
+    """Preempted requests stay out of the hit rate but must remain visible.
+
+    #25787 excludes them so a request re-reading its own blocks cannot inflate
+    the rate; preempted_view() exposes the same counts for separate reporting.
+    """
+    stats = PrefixCacheStats()
+    stats.record(num_tokens=100, num_hits=10, preempted=False)
+    stats.record(num_tokens=200, num_hits=180, preempted=True)
+
+    # The hit-rate population is untouched by the preempted request.
+    assert (stats.requests, stats.queries, stats.hits) == (1, 100, 10)
+    assert (stats.preempted_requests, stats.preempted_queries) == (1, 200)
+    assert stats.preempted_hits == 180
+
+    view = stats.preempted_view()
+    assert (view.requests, view.queries, view.hits) == (1, 200, 180)
+    assert view.reset == stats.reset
+
+    # Fed through the same aggregation, the preempted population reports the
+    # hit rate the primary counters cannot show.
+    metrics = CachingMetrics()
+    metrics.observe(view)
+    assert metrics.hit_rate == 0.9
+
+    primary = CachingMetrics()
+    primary.observe(stats)
+    assert primary.hit_rate == 0.1
+
+
+def test_preempted_view_is_empty_without_preemptions():
+    """No preemptions must leave the preempted series absent, not zeroed."""
+    stats = PrefixCacheStats()
+    stats.record(num_tokens=100, num_hits=10, preempted=False)
+
+    metrics = CachingMetrics()
+    metrics.observe(stats.preempted_view())
+    assert metrics.empty
+
+
 def test_metrics():
     """
     Test the prefix caching metrics.

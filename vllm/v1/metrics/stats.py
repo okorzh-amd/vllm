@@ -128,6 +128,20 @@ class PrefixCacheStats(BaseCacheStats):
     preempted_hits: int = 0
     """The `hits` number for preempted requests."""
 
+    def preempted_view(self) -> BaseCacheStats:
+        """The preempted counts shaped as plain cache stats.
+
+        Lets the same sliding-window aggregation be reused for the preempted
+        population without folding it into the hit rate, which #25787
+        deliberately keeps free of requests re-reading their own blocks.
+        """
+        return BaseCacheStats(
+            reset=self.reset,
+            requests=self.preempted_requests,
+            queries=self.preempted_queries,
+            hits=self.preempted_hits,
+        )
+
     def record(self, num_tokens: int, num_hits: int, preempted: bool) -> None:
         """Aggregate request information into the stats."""
         if preempted:

@@ -108,6 +108,7 @@ class LoggingStatLogger(StatLoggerBase):
         # TODO: Make the interval configurable.
         self.prefix_caching_metrics = CachingMetrics()
         self.connector_prefix_caching_metrics = CachingMetrics()
+        self.connector_preempted_prefix_caching_metrics = CachingMetrics()
         self.mm_caching_metrics = CachingMetrics()
 
         model_config = self.vllm_config.model_config
@@ -215,6 +216,9 @@ class LoggingStatLogger(StatLoggerBase):
                 self.connector_prefix_caching_metrics.observe(
                     scheduler_stats.connector_prefix_cache_stats
                 )
+                self.connector_preempted_prefix_caching_metrics.observe(
+                    scheduler_stats.connector_prefix_cache_stats.preempted_view()
+                )
 
             if scheduler_stats.spec_decoding_stats is not None:
                 self.spec_decoding_logging.observe(scheduler_stats.spec_decoding_stats)
@@ -303,6 +307,11 @@ class LoggingStatLogger(StatLoggerBase):
         if not self.connector_prefix_caching_metrics.empty:
             log_parts.append("External prefix cache hit rate: %.1f%%")
             log_args.append(self.connector_prefix_caching_metrics.hit_rate * 100)
+        if not self.connector_preempted_prefix_caching_metrics.empty:
+            log_parts.append("External prefix cache hit rate (preempted): %.1f%%")
+            log_args.append(
+                self.connector_preempted_prefix_caching_metrics.hit_rate * 100
+            )
         if not self.mm_caching_metrics.empty:
             log_parts.append("MM cache hit rate: %.1f%%")
             log_args.append(self.mm_caching_metrics.hit_rate * 100)
@@ -627,6 +636,41 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
         )
         self.counter_connector_prefix_cache_hits = create_metric_per_engine(
             counter_connector_prefix_cache_hits, per_engine_labelvalues
+        )
+
+        # Preempted requests are excluded from the counters above so that a
+        # request re-reading its own blocks does not inflate the hit rate
+        # (#25787). For an external tier that exclusion hides its main
+        # workload: offload exists to serve requests whose blocks were
+        # evicted under memory pressure, and preemption is that pressure.
+        # These counters expose it without changing the hit rate's meaning.
+        counter_connector_preempted_prefix_cache_queries = self._counter_cls(
+            name="vllm:external_preempted_prefix_cache_queries",
+            documentation=(
+                "External prefix cache queries from KV connector for requests "
+                "that were previously preempted, in terms of number of queried "
+                "tokens. Excluded from vllm:external_prefix_cache_queries."
+            ),
+            labelnames=labelnames,
+        )
+        self.counter_connector_preempted_prefix_cache_queries = (
+            create_metric_per_engine(
+                counter_connector_preempted_prefix_cache_queries,
+                per_engine_labelvalues,
+            )
+        )
+
+        counter_connector_preempted_prefix_cache_hits = self._counter_cls(
+            name="vllm:external_preempted_prefix_cache_hits",
+            documentation=(
+                "External prefix cache hits from KV connector for requests that "
+                "were previously preempted, in terms of number of cached tokens. "
+                "Excluded from vllm:external_prefix_cache_hits."
+            ),
+            labelnames=labelnames,
+        )
+        self.counter_connector_preempted_prefix_cache_hits = create_metric_per_engine(
+            counter_connector_preempted_prefix_cache_hits, per_engine_labelvalues
         )
 
         #
@@ -1135,6 +1179,12 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
                 )
                 self.counter_connector_prefix_cache_hits[engine_idx].inc(
                     scheduler_stats.connector_prefix_cache_stats.hits
+                )
+                self.counter_connector_preempted_prefix_cache_queries[engine_idx].inc(
+                    scheduler_stats.connector_prefix_cache_stats.preempted_queries
+                )
+                self.counter_connector_preempted_prefix_cache_hits[engine_idx].inc(
+                    scheduler_stats.connector_prefix_cache_stats.preempted_hits
                 )
 
             if scheduler_stats.spec_decoding_stats is not None:
