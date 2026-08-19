@@ -731,3 +731,77 @@ def test_blocks_per_chunk_must_be_positive():
 
     with pytest.raises(ValueError, match="greater than 0"):
         build_offloading_config(config, _make_kv_cache_config())
+
+
+def _make_mla_mamba_kv_cache_config(num_blocks: int = 4) -> KVCacheConfig:
+    """K3-shaped hybrid: a TP-replicated MLA latent beside a recurrent group."""
+    mla = _mla_spec()
+    mamba = MambaSpec(
+        block_size=16,
+        shapes=((8, 64),),
+        dtypes=(torch.float32,),
+        mamba_cache_mode="align",
+    )
+    page = max(mla.page_size_bytes, mamba.page_size_bytes)
+    return KVCacheConfig(
+        num_blocks=num_blocks,
+        kv_cache_tensors=[
+            KVCacheTensor(size=page * num_blocks, shared_by=["mla_layer", "ssm_layer"])
+        ],
+        kv_cache_groups=[
+            KVCacheGroupSpec(["mla_layer"], mla),
+            KVCacheGroupSpec(["ssm_layer"], mamba),
+        ],
+    )
+
+
+def test_per_group_rows_deduplicate_mla_and_drop_cross_group_padding():
+    """The uniform row charges every group for world_size copies of the widest
+    group's page. Per-group rows charge the replicated MLA latent once and the
+    recurrent group its own width."""
+    tp_size = 8
+    config = _make_vllm_config(
+        extra_config={"canonical_layout": True, "per_group_cpu_pools": True},
+        tensor_parallel_size=tp_size,
+    )
+    config.model_config.use_mla = True
+    kv_cache_config = _make_mla_mamba_kv_cache_config()
+
+    offloading_config = build_offloading_config(config, kv_cache_config)
+    rows = offloading_config.group_canonical_bytes_per_block
+    assert rows is not None
+    mla_row, mamba_row = rows
+
+    mla_spec = kv_cache_config.kv_cache_groups[0].kv_cache_spec
+    mamba_spec = kv_cache_config.kv_cache_groups[1].kv_cache_spec
+    assert mla_row == mla_spec.real_page_size_bytes
+    assert mamba_row == tp_size * mamba_spec.page_size_bytes
+
+    # The layout this replaces: one row per group, each world_size copies of
+    # the padded page shared by both groups.
+    direct_row = offloading_config.worker_kv_bytes_per_block * tp_size
+    assert sum(rows) < 2 * direct_row
+
+
+def test_per_group_pools_require_canonical_layout():
+    config = _make_vllm_config(extra_config={"per_group_cpu_pools": True})
+    with pytest.raises(ValueError, match="requires canonical_layout"):
+        build_offloading_config(config, _make_kv_cache_config())
+
+
+def test_per_group_pools_reject_uncertifiable_layouts():
+    """Packed KV has no per-layer refs to certify, so the scheduler cannot
+    size per-group rows the worker would agree with."""
+    config = _make_vllm_config(
+        extra_config={"canonical_layout": True, "per_group_cpu_pools": True}
+    )
+    with pytest.raises(ValueError, match="could not be derived"):
+        build_offloading_config(config, _make_sizing_kv_cache_config(packed=True))
+
+
+def test_group_rows_are_absent_without_canonical_layout():
+    offloading_config = build_offloading_config(
+        _make_vllm_config(), _make_mla_mamba_kv_cache_config()
+    )
+    assert offloading_config.group_canonical_bytes_per_block is None
+    assert not offloading_config.per_group_pools

@@ -5,6 +5,7 @@ from typing import Any
 import torch
 from typing_extensions import override
 
+from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.utils.math_utils import round_up
 from vllm.v1.kv_offload.base import (
@@ -20,8 +21,12 @@ from vllm.v1.kv_offload.base import (
 from vllm.v1.kv_offload.config import OffloadingConfig
 from vllm.v1.kv_offload.cpu.common import CPUOffloadingMetrics
 from vllm.v1.kv_offload.cpu.gpu_worker import CPUOffloadingWorker
+from vllm.v1.kv_offload.cpu.group_arena import GroupArena
 from vllm.v1.kv_offload.cpu.manager import CPUOffloadingManager
+from vllm.v1.kv_offload.cpu.per_group_manager import PerGroupCPUOffloadingManager
 from vllm.v1.kv_offload.cpu.shared_offload_region import SharedOffloadRegion
+
+logger = init_logger(__name__)
 
 
 class CPUOffloadingSpec(OffloadingSpec):
@@ -88,6 +93,48 @@ class CPUOffloadingSpec(OffloadingSpec):
         self.kv_bytes_per_chunk = 0
         self.cpu_page_size_per_worker = 0
         self.replicated_layout = config.replicated_layout and self._uses_shared_region()
+
+        # Per-group pools give each KV cache group a host row sized from its
+        # own canonical pages, instead of one row of
+        # worker_kv_bytes_per_block * world_size shared by every group. On a
+        # hybrid model that removes both the replication of KV that is
+        # identical on every rank and the padding of narrow groups up to the
+        # widest one.
+        self.arena: GroupArena | None = None
+        if config.per_group_pools:
+            assert config.group_canonical_bytes_per_block is not None
+            if not self._uses_shared_region():
+                raise ValueError(
+                    "per_group_cpu_pools needs the shared /dev/shm offload "
+                    "region, which this platform does not use."
+                )
+            extent_bytes = self.extra_config.get("cpu_pool_extent_bytes")
+            self.arena = GroupArena(
+                group_row_bytes=[
+                    group_bytes * self.blocks_per_chunk
+                    for group_bytes in config.group_canonical_bytes_per_block
+                ],
+                budget_bytes=int(cpu_bytes_to_use),
+                extent_bytes=None if extent_bytes is None else int(extent_bytes),
+            )
+            # Deduplication is now per layer, driven by each mapping's writer
+            # election; the aggregate flag would additionally silence every
+            # non-zero rank's stores.
+            self.replicated_layout = False
+            direct_row = (
+                config.worker_kv_bytes_per_block * world_size * self.blocks_per_chunk
+            )
+            logger.info(
+                "Per-group CPU pools: rows %s, against %d per group with the "
+                "direct layout — %.2fx less host memory to hold one block of "
+                "every group. Groups that store less often than every block "
+                "(recurrent checkpoints) widen that further at runtime.",
+                self.arena.group_row_bytes,
+                direct_row,
+                (direct_row * len(self.arena.group_row_bytes))
+                / max(sum(self.arena.group_row_bytes), 1),
+            )
+
         if config.worker_kv_bytes_per_block > 0 and world_size > 0:
             num_copies = 1 if self.replicated_layout else world_size
             kv_bytes_per_block = config.worker_kv_bytes_per_block * num_copies
@@ -131,6 +178,17 @@ class CPUOffloadingSpec(OffloadingSpec):
             # Maximum entries in the internal tracker's LRU table.
             max_tracker_size = int(self.extra_config.get("max_tracker_size", 64_000))
 
+            if self.arena is not None:
+                self._manager = PerGroupCPUOffloadingManager(
+                    arena=self.arena,
+                    cache_policy=self.eviction_policy,
+                    cache_policy_module_path=self.cache_policy_module_path,
+                    enable_events=self.kv_events_config.enable_kv_cache_events,
+                    store_threshold=store_threshold,
+                    max_tracker_size=max_tracker_size,
+                )
+                return self._manager
+
             self._manager = CPUOffloadingManager(
                 num_blocks=self.num_blocks,
                 cache_policy=self.eviction_policy,
@@ -147,6 +205,9 @@ class CPUOffloadingSpec(OffloadingSpec):
         return current_platform.is_cuda_alike()
 
     def create_worker(self, kv_caches: CanonicalKVCaches) -> CPUOffloadingWorker:
+        if self.arena is not None:
+            return self._create_per_group_worker(kv_caches)
+
         mmap_region: SharedOffloadRegion | None = None
         # num_blocks == 0 would size the region to zero bytes, which cannot be
         # mmap'd; fall back to the tensor path (empty tensors) as before.
@@ -175,6 +236,63 @@ class CPUOffloadingSpec(OffloadingSpec):
         except Exception:
             if mmap_region is not None:
                 mmap_region.cleanup()
+            raise
+
+    def _create_per_group_worker(
+        self, kv_caches: CanonicalKVCaches
+    ) -> CPUOffloadingWorker:
+        assert self.arena is not None
+        # Fail closed rather than silently reverting to the direct layout: the
+        # scheduler already sized its pools from the canonical widths, so a
+        # worker on a different layout would write to the wrong offsets.
+        derived: list[int] = []
+        expected: list[int] = []
+        for row, group_refs in zip(
+            self.arena.group_row_bytes, kv_caches.group_data_refs
+        ):
+            if not group_refs:
+                continue
+            group_bytes = 0
+            for ref in group_refs:
+                if ref.mapping is None:
+                    raise RuntimeError(
+                        "per_group_cpu_pools was requested but the live KV "
+                        "cache layout could not be certified for canonical "
+                        "offload. Remove per_group_cpu_pools from "
+                        "kv_connector_extra_config."
+                    )
+                group_bytes += ref.mapping.canonical_page_size_bytes
+            derived.append(group_bytes * self.blocks_per_chunk)
+            expected.append(row)
+        assert all(d <= e for d, e in zip(derived, expected)), (
+            f"worker-derived group rows {derived} exceed the rows the "
+            f"scheduler sized the arena with {expected}"
+        )
+
+        world_size = self.config.parallel.world_size
+        rank = torch.accelerator.current_device_index() % world_size
+        mmap_region = SharedOffloadRegion(
+            engine_id=self.config.engine_id,
+            num_blocks=0,
+            rank=rank,
+            kv_bytes_per_block=0,
+            cpu_page_size=0,
+            arena_bytes=self.arena.total_bytes,
+            stripe_count=world_size,
+            numa_interleave=self.extra_config.get("cpu_pool_numa_policy", "interleave")
+            == "interleave",
+        )
+        try:
+            return CPUOffloadingWorker(
+                kv_caches=kv_caches,
+                blocks_per_chunk=self.blocks_per_chunk,
+                num_cpu_blocks=0,
+                mmap_region=mmap_region,
+                canonical_layout=True,
+                per_group_pools=True,
+            )
+        except Exception:
+            mmap_region.cleanup()
             raise
 
     @override

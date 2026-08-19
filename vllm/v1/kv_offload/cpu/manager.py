@@ -47,6 +47,7 @@ class CPUOffloadingManager(OffloadingManager):
         enable_events: bool = False,
         store_threshold: int = 1,
         max_tracker_size: int = 64_000,
+        policy_capacity: int | None = None,
     ):
         self.medium: Medium = Medium.CPU
         self._num_blocks: int = num_blocks
@@ -56,7 +57,12 @@ class CPUOffloadingManager(OffloadingManager):
         policy_cls = CachePolicyFactory.get_cache_policy_cls(
             cache_policy, cache_policy_module_path
         )
-        self._policy: CachePolicy = policy_cls(cache_capacity=num_blocks)
+        # policy_capacity lets a pool whose slot count grows over its lifetime
+        # (per-group pools backed by on-demand extents) size the policy once,
+        # at the ceiling it can ever reach.
+        self._policy: CachePolicy = policy_cls(
+            cache_capacity=num_blocks if policy_capacity is None else policy_capacity
+        )
         # Track the number of blocks in the cache that are evictable. i.e. ref_cnt 0.
         self._num_evictable_cache_blocks: int = 0
         # Track blocks with an in-flight store (ref_cnt -1, not yet completed).
@@ -76,6 +82,41 @@ class CPUOffloadingManager(OffloadingManager):
 
     def _get_num_free_blocks(self) -> int:
         return len(self._free_list) + self._num_blocks - self._num_allocated_blocks
+
+    @property
+    def num_free_blocks(self) -> int:
+        return self._get_num_free_blocks()
+
+    @property
+    def num_blocks(self) -> int:
+        return self._num_blocks
+
+    def set_num_blocks(self, num_blocks: int) -> None:
+        """Grow this pool's slot capacity.
+
+        Used by the per-group dispatcher, which backs each group with extents
+        on demand rather than a capacity fixed at construction. The cache
+        policy keeps the capacity it was built with (an upper bound), so its
+        bookkeeping stays valid as the pool grows.
+        """
+        assert num_blocks >= self._num_blocks
+        self._num_blocks = num_blocks
+
+    @property
+    def num_used_blocks(self) -> int:
+        return (
+            self._num_allocated_blocks
+            - len(self._free_list)
+            - self._num_evictable_cache_blocks
+        )
+
+    @property
+    def num_write_pending_blocks(self) -> int:
+        return self._num_write_pending_blocks
+
+    def count_unstored(self, keys: Collection[OffloadKey]) -> int:
+        """How many of these keys would need a fresh slot."""
+        return sum(1 for key in keys if self._policy.get(key) is None)
 
     def _allocate_blocks(self, keys: list[OffloadKey]) -> list[BlockStatus]:
         num_fresh = min(len(keys), self._num_blocks - self._num_allocated_blocks)

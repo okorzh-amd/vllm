@@ -56,6 +56,43 @@ def _can_set_mempolicy() -> bool:
         return False
 
 
+def interleave_memory(ptr: int, size: int) -> bool:
+    """Apply MPOL_INTERLEAVE over an already-mapped, not-yet-faulted range.
+
+    Host buffers shared by every rank (e.g. a deduplicated KV offload region,
+    where one canonical copy replaces world_size per-rank copies) would
+    otherwise land on whichever node faulted them in first and serve every
+    rank from that node's memory controller. Must be called before the range
+    is populated; pages already faulted in keep their placement.
+
+    Returns True if the policy was applied.
+    """
+    if size <= 0:
+        return False
+    try:
+        libnuma = get_libnuma()
+        if libnuma is None or libnuma.numa_available() < 0:
+            return False
+        if libnuma.numa_num_configured_nodes() < 2:
+            return False
+        nodes = ctypes.c_void_p.in_dll(libnuma, "numa_all_nodes_ptr")
+        if not nodes.value:
+            return False
+        libnuma.numa_interleave_memory.restype = None
+        libnuma.numa_interleave_memory.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_size_t,
+            ctypes.c_void_p,
+        ]
+        libnuma.numa_interleave_memory(
+            ctypes.c_void_p(ptr), ctypes.c_size_t(size), nodes
+        )
+        return True
+    except Exception:
+        logger.warning("Failed to set MPOL_INTERLEAVE on host buffer", exc_info=True)
+        return False
+
+
 def _is_auto_numa_available() -> bool:
     """Check whether automatic GPU-to-NUMA detection should be attempted."""
     from vllm.platforms import current_platform

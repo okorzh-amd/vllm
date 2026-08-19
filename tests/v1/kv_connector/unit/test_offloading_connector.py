@@ -297,6 +297,39 @@ def test_cpu_offloading(
         del llm
 
 
+@pytest.mark.skipif(
+    not current_platform.is_cuda_alike(), reason="needs the shared offload region"
+)
+def test_cpu_offloading_per_group_pools() -> None:
+    """Per-group pools address host slots by arena byte offset instead of by
+    row index, and elect one rank per replicated slot. Both change where bytes
+    land, so the reload has to still produce the same tokens."""
+    kv_transfer_config = KVTransferConfig(
+        kv_connector="OffloadingConnector",
+        kv_role="kv_both",
+        kv_connector_extra_config={
+            "cpu_bytes_to_use": 4 << 30,
+            "canonical_layout": True,
+            "per_group_cpu_pools": True,
+            # Small extents so the arena hands out several of them and the
+            # offset lookup is exercised, not just a flat stride.
+            "cpu_pool_extent_bytes": 256 << 20,
+        },
+    )
+
+    llm = LLM(
+        model="meta-llama/Llama-3.2-1B-Instruct",
+        max_model_len=4096,
+        gpu_memory_utilization=0.5,
+        kv_transfer_config=kv_transfer_config,
+        **({"max_num_seqs": 1} if current_platform.is_rocm() else {}),
+    )
+    try:
+        _accuracy_test(llm, None)
+    finally:
+        del llm
+
+
 @pytest.mark.skipif(not current_platform.is_cuda(), reason="Requires CUDA")
 def test_cpu_offloading_metrics() -> None:
     """Verify that offloading Prometheus metrics (new flat and deprecated

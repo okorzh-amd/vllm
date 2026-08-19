@@ -272,3 +272,178 @@ def test_cross_topology_roundtrip(writer_tp: int, reader_tp: int):
     finally:
         for region in regions:
             region.cleanup()
+
+
+# --- per-group pools -------------------------------------------------------
+
+_PG_PAGE = 1024
+_PG_BLOCKS = 4
+
+
+def _replicated_mapping(rank: int, num_ranks: int) -> CanonicalPageMapping:
+    """TP-replicated page: one canonical copy, ranks take turns writing it."""
+    whole = CopyRun(0, 0, _PG_PAGE, 1, _PG_PAGE, _PG_PAGE)
+    return CanonicalPageMapping(_PG_PAGE, _PG_PAGE, (whole,), num_ranks, rank, True)
+
+
+def _private_mapping(rank: int, num_ranks: int) -> CanonicalPageMapping:
+    """Opaque fallback: every rank keeps its own page, side by side."""
+    whole = CopyRun(0, rank * _PG_PAGE, _PG_PAGE, 1, _PG_PAGE, _PG_PAGE)
+    return CanonicalPageMapping(num_ranks * _PG_PAGE, _PG_PAGE, (whole,), 1, 0, False)
+
+
+def _per_group_handler(gpu_tensors, arena_layout, mappings, gpu_to_cpu):
+    refs = [
+        [CanonicalKVCacheRef(tensor_idx=i, page_size_bytes=_PG_PAGE, mapping=mapping)]
+        for i, mapping in enumerate(mappings)
+    ]
+    return SingleDirectionOffloadingHandler(
+        gpu_tensors=gpu_tensors,
+        cpu_tensors=[],
+        blocks_per_chunk=1,
+        layer_refs_per_group=refs,
+        gpu_to_cpu=gpu_to_cpu,
+        canonical_layout=True,
+        arena=arena_layout,
+    )
+
+
+def _per_group_transfer(handler, arena, gpu_to_cpu):
+    slots = list(range(_PG_BLOCKS))
+    gpu_spec = GPULoadStoreSpec(
+        slots + slots,
+        group_sizes=(_PG_BLOCKS, _PG_BLOCKS),
+        block_indices=(0, 0),
+    )
+    cpu_spec = CPULoadStoreSpec(
+        slots + slots,
+        arena.offsets(0, slots) + arena.offsets(1, slots),
+    )
+    src, dst = (gpu_spec, cpu_spec) if gpu_to_cpu else (cpu_spec, gpu_spec)
+    assert handler.transfer_async(0, src, dst)
+    deadline = time.time() + 30
+    while time.time() < deadline:
+        if handler.get_finished():
+            return
+        time.sleep(0.001)
+    raise TimeoutError("transfer did not complete")
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_per_group_arena_roundtrip_dedups_replicated_group():
+    """Two ranks, two groups of different widths in one arena: the replicated
+    group is written once and read back by both ranks, the private group keeps
+    a per-rank copy, and neither group's slots touch the other's bytes."""
+    from vllm.v1.kv_offload.cpu.gpu_worker import GroupArenaLayout
+    from vllm.v1.kv_offload.cpu.group_arena import GroupArena
+
+    torch.manual_seed(0)
+    num_ranks = 2
+    arena = GroupArena(
+        # replicated group needs one page per block, private group needs two
+        group_row_bytes=[_PG_PAGE, num_ranks * _PG_PAGE],
+        budget_bytes=8 * 64 * 1024,
+        extent_bytes=64 * 1024,
+    )
+    region = SharedOffloadRegion(
+        engine_id=f"pergroup-{uuid.uuid4()}",
+        num_blocks=0,
+        rank=0,
+        kv_bytes_per_block=0,
+        cpu_page_size=0,
+        arena_bytes=arena.total_bytes,
+        stripe_count=1,
+    )
+    try:
+        pin_mmap_region(region)
+        layout = GroupArenaLayout(base_ptr=region.base_ptr, layer_offsets=[[0], [0]])
+
+        # Group 0 is replicated, so every rank holds identical bytes.
+        shared = torch.randint(
+            -128, 128, (_PG_BLOCKS, _PG_PAGE), dtype=torch.int8, device="cuda"
+        )
+        private = [
+            torch.randint(
+                -128, 128, (_PG_BLOCKS, _PG_PAGE), dtype=torch.int8, device="cuda"
+            )
+            for _ in range(num_ranks)
+        ]
+
+        for rank in range(num_ranks):
+            store = _per_group_handler(
+                [shared, private[rank]],
+                layout,
+                [
+                    _replicated_mapping(rank, num_ranks),
+                    _private_mapping(rank, num_ranks),
+                ],
+                gpu_to_cpu=True,
+            )
+            _per_group_transfer(store, arena, gpu_to_cpu=True)
+        torch.accelerator.synchronize()
+
+        for rank in range(num_ranks):
+            back = [
+                torch.zeros(_PG_BLOCKS, _PG_PAGE, dtype=torch.int8, device="cuda")
+                for _ in range(2)
+            ]
+            load = _per_group_handler(
+                back,
+                layout,
+                [
+                    _replicated_mapping(rank, num_ranks),
+                    _private_mapping(rank, num_ranks),
+                ],
+                gpu_to_cpu=False,
+            )
+            _per_group_transfer(load, arena, gpu_to_cpu=False)
+            torch.accelerator.synchronize()
+            assert torch.equal(back[0], shared), f"rank {rank} replicated group"
+            assert torch.equal(back[1], private[rank]), f"rank {rank} private group"
+    finally:
+        region.cleanup()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_per_group_store_rotates_writers_over_slots():
+    """Each replicated slot must be written by exactly one rank; with only
+    one of two ranks storing, half the slots stay untouched."""
+    from vllm.v1.kv_offload.cpu.gpu_worker import GroupArenaLayout
+    from vllm.v1.kv_offload.cpu.group_arena import GroupArena
+
+    torch.manual_seed(0)
+    arena = GroupArena(
+        group_row_bytes=[_PG_PAGE, 2 * _PG_PAGE],
+        budget_bytes=8 * 64 * 1024,
+        extent_bytes=64 * 1024,
+    )
+    region = SharedOffloadRegion(
+        engine_id=f"pergroup-{uuid.uuid4()}",
+        num_blocks=0,
+        rank=0,
+        kv_bytes_per_block=0,
+        cpu_page_size=0,
+        arena_bytes=arena.total_bytes,
+        stripe_count=1,
+    )
+    try:
+        pin_mmap_region(region)
+        layout = GroupArenaLayout(base_ptr=region.base_ptr, layer_offsets=[[0], [0]])
+        ones = torch.ones(_PG_BLOCKS, _PG_PAGE, dtype=torch.int8, device="cuda")
+        store = _per_group_handler(
+            [ones, ones],
+            layout,
+            [_replicated_mapping(0, 2), _private_mapping(0, 2)],
+            gpu_to_cpu=True,
+        )
+        _per_group_transfer(store, arena, gpu_to_cpu=True)
+        torch.accelerator.synchronize()
+
+        host = np.frombuffer(region.mmap_obj, dtype=np.int8)
+        for slot in range(_PG_BLOCKS):
+            start = arena.offset(0, slot)
+            page = host[start : start + _PG_PAGE]
+            written = bool((page == 1).all())
+            assert written == (slot % 2 == 0), f"slot {slot}"
+    finally:
+        region.cleanup()

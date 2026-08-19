@@ -252,6 +252,13 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
         return metrics
 
     def __init__(self, config: OffloadingConfig):
+        if config.per_group_pools:
+            # Secondary tiers address the primary by a uniform row stride
+            # (create_kv_memoryview) and derive a persistence identity from the
+            # aggregate layout flags, neither of which survives per-group rows.
+            raise ValueError(
+                "per_group_cpu_pools is not supported with secondary tiers."
+            )
         super().__init__(config)
         # Redeclare for mypy: parent sets this but `--follow-imports skip` hides it
         self._manager: OffloadingManager | None = None

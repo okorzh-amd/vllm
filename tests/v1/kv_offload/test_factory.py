@@ -53,6 +53,8 @@ def _make_offloading_config(
     data_parallel_rank_local: int | None = None,
     is_parallelism_agnostic: bool = False,
     replicated_layout: bool = False,
+    group_canonical_bytes_per_block: tuple[int, ...] | None = None,
+    per_group_pools: bool = False,
     extra_config: dict[str, Any] | None = None,
 ) -> OffloadingConfig:
     normalized_extra_config = dict(extra_config or {})
@@ -88,6 +90,8 @@ def _make_offloading_config(
             is_parallelism_agnostic=is_parallelism_agnostic,
         ),
         replicated_layout=replicated_layout,
+        group_canonical_bytes_per_block=group_canonical_bytes_per_block,
+        per_group_pools=per_group_pools,
     )
 
 
@@ -592,3 +596,46 @@ def test_build_metric_definitions_returns_counter_at_threshold():
     metrics = spec_cls.build_metric_definitions(extra_config)
 
     assert CPUOffloadingMetrics.STORES_SKIPPED in metrics
+
+
+def test_cpu_spec_builds_a_per_group_arena_from_canonical_widths(monkeypatch):
+    """The scheduler sizes one pool per group from the canonical widths, not
+    from worker_kv_bytes_per_block x world_size."""
+    import vllm.v1.kv_offload.cpu.spec as cpu_spec_module
+    from vllm.v1.kv_offload.cpu.per_group_manager import PerGroupCPUOffloadingManager
+
+    monkeypatch.setattr(cpu_spec_module.current_platform, "is_cuda_alike", lambda: True)
+    replicated_row = 1 << 20
+    private_row = 8 << 20
+    spec = _create_spec(
+        cpu_bytes_to_use=8 << 30,
+        world_size=8,
+        groups=(
+            OffloadingGroupConfig(16, ("mla",)),
+            OffloadingGroupConfig(16, ("ssm",)),
+        ),
+        group_canonical_bytes_per_block=(replicated_row, private_row),
+        per_group_pools=True,
+        extra_config={"canonical_layout": True, "cpu_pool_extent_bytes": 1 << 30},
+    )
+
+    assert spec.arena is not None
+    assert spec.arena.group_row_bytes == [replicated_row, private_row]
+    # The aggregate flag would silence every non-zero rank's stores; writer
+    # election is per layer now.
+    assert spec.replicated_layout is False
+    assert isinstance(spec.get_manager(), PerGroupCPUOffloadingManager)
+
+
+def test_per_group_pools_need_the_shared_region(monkeypatch):
+    import vllm.v1.kv_offload.cpu.spec as cpu_spec_module
+
+    monkeypatch.setattr(
+        cpu_spec_module.current_platform, "is_cuda_alike", lambda: False
+    )
+    with pytest.raises(ValueError, match="shared /dev/shm"):
+        _create_spec(
+            world_size=2,
+            group_canonical_bytes_per_block=(1 << 20, 1 << 20),
+            per_group_pools=True,
+        )

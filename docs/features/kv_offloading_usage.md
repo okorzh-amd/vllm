@@ -78,6 +78,49 @@ vllm serve <model> \
 | `offload_prompt_only` | no | `true` | both | If `true`, only prompt (prefill) blocks are offloaded; decode blocks are skipped. |
 | `self_describing_kv_events` | no | `false` | both | Opt-in. When `true` *and* KV cache events are enabled (`--kv-events-config` with `enable_kv_cache_events`), the connector emits self-describing block-granular `BlockStored`/`BlockRemoved` payloads (constituent block hashes, whole-chunk `token_ids`, per-block `block_size`, parent hash, LoRA + group/cache-spec metadata) instead of the placeholder fallback, so external KV-event consumers can index offloaded blocks. Inert unless events are enabled. With `TieringOffloadingSpec`, a CPU promotion is self-describing when a local request observes its primary-tier `HIT` before event translation; otherwise its stored event may retain the placeholder, while a later `HIT` can backfill metadata for removal. Pending-removal/re-promotion races and externally initiated promotions may also produce placeholders, and consumers must ignore removals for unknown hashes. Partial recurrent tails emit the hash-aligned portion from the physical block start through the tail boundary. Other sliding-window/SSM chunks keep the placeholder fallback. In chunk mode (`block_size` > GPU block size, or `blocks_per_chunk` > 1), overlapping chunks re-announce shared per-block hashes, so consumers must reference-count (deduplicate) repeated store/remove announcements. |
 | `spec_module_path` | no | — | both | Python import path for a custom `OffloadingSpec` not in the built-in registry. Required only when `spec_name` is not built-in (advanced). |
+| `canonical_layout` | no | `false` | both | Store each layer's *canonical* page — the block's bytes with parallelism removed — instead of one private page per worker. Certified per layer at registration against the live tensor strides; startup fails if any layer cannot be certified. |
+| `per_group_cpu_pools` | no | `false` | single-tier | Give each KV cache group a host row sized from its own canonical pages. Requires `canonical_layout`. See [Per-Group CPU Pools](#per-group-cpu-pools). |
+| `cpu_pool_extent_bytes` | no | `max(1 GiB, 16 x widest group row)` | single-tier | Granularity at which the host pool is apportioned between groups. Must be at least the widest group row. |
+| `cpu_pool_numa_policy` | no | `interleave` | single-tier | `interleave` applies `MPOL_INTERLEAVE` to the host pool before it is faulted in; `none` leaves placement to first touch. |
+
+## Per-Group CPU Pools
+
+Without this option every KV cache group gets the same host row:
+`worker_kv_bytes_per_block x world_size`. On a hybrid model that overcharges
+twice. KV that is bit-identical on every rank — the MLA latent, which is
+replicated rather than head-sharded — is stored `world_size` times. And because
+one physical KV tensor is shared by one layer from every group and padded to the
+widest page, a narrow group's row is charged at the widest group's width.
+`canonical_layout` alone does not recover either: its row is still a max over
+the groups sharing each tensor.
+
+`per_group_cpu_pools` sizes a row per group from that group's own canonical
+pages, so the replicated group is stored once and each group pays its own
+width. Ranks take turns writing each replicated slot, which also divides the
+store bandwidth those layers consume.
+
+```json
+{
+  "kv_connector": "OffloadingConnector",
+  "kv_connector_extra_config": {
+    "cpu_bytes_to_use": 1099511627776,
+    "canonical_layout": true,
+    "per_group_cpu_pools": true
+  }
+}
+```
+
+How much host memory this frees depends on how often each group stores. A
+full-attention group stores on every block; a recurrent group stores only at
+its checkpoints. That ratio is a runtime property, so the pool is not split up
+front — it is handed out in extents on demand, capped by a
+demand-proportional quota so a group that stores constantly cannot permanently
+crowd out one that stores rarely. `benchmarks/kernels/benchmark_kv_offload_per_group_pools.py`
+prints the capacity for a given geometry and checkpoint cadence.
+
+Not supported with secondary tiers, packed KV, or cross-layer blocks; startup
+fails rather than silently falling back, because the scheduler has already
+sized its pools from the canonical widths.
 
 ## Custom Eviction Policies
 

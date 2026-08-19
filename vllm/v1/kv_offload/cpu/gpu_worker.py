@@ -26,6 +26,7 @@ from vllm.v1.kv_offload.base import (
     OffloadingWorker,
     TransferResult,
 )
+from vllm.v1.kv_offload.cpu.common import CPULoadStoreSpec
 from vllm.v1.kv_offload.cpu.shared_offload_region import SharedOffloadRegion
 from vllm.v1.kv_offload.cpu.swap_blocks_triton import (
     THRESHOLD_BYTES,
@@ -121,6 +122,62 @@ def compute_sub_block_ptrs(
     # Flatten and apply skip_count / truncation
     flat = all_ptrs.ravel()
     output[:] = flat[skip_count : skip_count + num_sub_blocks]
+
+
+def compute_arena_ptrs(
+    slot_offsets: np.ndarray,
+    blocks_per_chunk: int,
+    output: np.ndarray,
+    layer_base_ptr: int,
+    canonical_page_size: int,
+    skip_count: int = 0,
+):
+    """Byte pointers for one layer's canonical pages inside arena slots.
+
+    The per-group arena addresses a slot by an explicit byte offset rather
+    than a row index, because group rows differ in width and a group's slots
+    are not contiguous. ``layer_base_ptr`` is the arena base plus this layer's
+    offset within its group's row.
+    """
+    assert skip_count < blocks_per_chunk or blocks_per_chunk == 1
+    num_sub_blocks = len(output)
+    offsets = slot_offsets.astype(np.uint64)
+
+    if blocks_per_chunk == 1:
+        output[:] = layer_base_ptr + offsets[:num_sub_blocks]
+        return
+
+    sub_offsets = np.arange(blocks_per_chunk, dtype=np.uint64) * canonical_page_size
+    flat = (
+        (layer_base_ptr + offsets[:, np.newaxis]) + sub_offsets[np.newaxis, :]
+    ).ravel()
+    output[:] = flat[skip_count : skip_count + num_sub_blocks]
+
+
+@dataclass(frozen=True)
+class GroupArenaLayout:
+    """Placement of each group's layers inside one host slot row."""
+
+    base_ptr: int
+    # Parallel to layer_refs_per_group: byte offset of each layer's canonical
+    # pages within its group's row.
+    layer_offsets: list[list[int]]
+
+
+def _group_layer_offsets(
+    layer_refs_per_group: list[list[CanonicalKVCacheRef]], blocks_per_chunk: int
+) -> list[list[int]]:
+    """Lay each group's layers out back to back inside the group's row."""
+    offsets: list[list[int]] = []
+    for layer_refs in layer_refs_per_group:
+        group_offsets: list[int] = []
+        cursor = 0
+        for ref in layer_refs:
+            assert ref.mapping is not None
+            group_offsets.append(cursor)
+            cursor += ref.mapping.canonical_page_size_bytes * blocks_per_chunk
+        offsets.append(group_offsets)
+    return offsets
 
 
 class CopyPlan(NamedTuple):
@@ -249,6 +306,7 @@ class SingleDirectionOffloadingHandler:
         layer_refs_per_group: list[list[CanonicalKVCacheRef]],
         gpu_to_cpu: bool,
         canonical_layout: bool = False,
+        arena: GroupArenaLayout | None = None,
     ):
         """
         Initialize a SingleDirectionOffloadingHandler.
@@ -258,14 +316,19 @@ class SingleDirectionOffloadingHandler:
                 Each of shape (num_gpu_blocks, gpu_page_size_bytes) with dtype int8.
             cpu_tensors: list of CPU KV cache tensors.
                 Each of shape (num_cpu_blocks, cpu_page_size_bytes) with dtype int8.
-                Order should match gpu_tensors.
+                Order should match gpu_tensors. Empty in arena mode, where the
+                CPU side is addressed by byte offset instead.
             layer_refs_per_group: list of CanonicalKVCacheRef per group.
             gpu_to_cpu: if True, transfer from GPU to CPU; otherwise CPU to GPU.
             canonical_layout: if True, CPU pages use the canonical layout
                 described by the refs' mappings.
+            arena: per-group host layout. When given, CPU slots are located by
+                the byte offsets carried in the CPU spec rather than by a row
+                index into cpu_tensors.
         """
-        assert len(gpu_tensors) == len(cpu_tensors)
         assert len(gpu_tensors) > 0
+        assert arena is None or canonical_layout
+        self._arena = arena
 
         canonical_bytes_per_block = (
             _canonical_block_sizes(layer_refs_per_group, len(gpu_tensors))
@@ -274,10 +337,15 @@ class SingleDirectionOffloadingHandler:
         )
 
         # assert input tensors are as expected
-        for t_idx, (gpu_tensor, cpu_tensor) in enumerate(zip(gpu_tensors, cpu_tensors)):
+        if arena is None:
+            assert len(gpu_tensors) == len(cpu_tensors)
+        for t_idx, gpu_tensor in enumerate(gpu_tensors):
             assert gpu_tensor.dtype == torch.int8
             assert gpu_tensor.ndim == 2
             assert gpu_tensor.is_cuda or gpu_tensor.is_xpu
+            if arena is not None:
+                continue
+            cpu_tensor = cpu_tensors[t_idx]
             assert cpu_tensor.dtype == torch.int8
             assert cpu_tensor.ndim == 2
             assert cpu_tensor.device.type == "cpu"
@@ -365,6 +433,7 @@ class SingleDirectionOffloadingHandler:
         all_dst: np.ndarray,
         all_sizes: np.ndarray,
         op_idx: int,
+        group_cpu_ids: np.ndarray | None = None,
     ) -> tuple[int, int]:
         """Fill one group's copy descriptors for the direct (worker-private)
         layout: one whole-page copy per (block, ref).
@@ -407,6 +476,7 @@ class SingleDirectionOffloadingHandler:
         all_dst: np.ndarray,
         all_sizes: np.ndarray,
         op_idx: int,
+        group_cpu_ids: np.ndarray | None = None,
     ) -> tuple[int, int]:
         """Fill one group's copy descriptors for the canonical layout:
         scatter each block through the ref's precomputed CopyPlan, keeping
@@ -423,40 +493,78 @@ class SingleDirectionOffloadingHandler:
             self._scratch_bases_dst = np.empty(group_size, dtype=np.uint64)
 
         num_bytes = 0
-        for plan, data_ref in zip(
-            self._canonical_copy_plans[g_idx], self.layer_refs_per_group[g_idx]
+        for ref_idx, (plan, data_ref) in enumerate(
+            zip(self._canonical_copy_plans[g_idx], self.layer_refs_per_group[g_idx])
         ):
             if plan.num_frags == 0:
                 continue
             t_idx = data_ref.tensor_idx
+            mapping = data_ref.mapping
+            assert mapping is not None
 
             # 1. Base byte pointer of every block on each side
             block_bases_src = self._scratch_bases_src[:group_size]
             block_bases_dst = self._scratch_bases_dst[:group_size]
-            compute_sub_block_ptrs(
-                group_src,
-                self.src_blocks_per_chunk,
-                block_bases_src,
-                self.src_tensors[t_idx],
-                skip_count=src_skip_count,
-            )
-            compute_sub_block_ptrs(
-                group_dst,
-                self.dst_blocks_per_chunk,
-                block_bases_dst,
-                self.dst_tensors[t_idx],
-                skip_count=dst_skip_count,
-            )
+            if self._arena is None:
+                compute_sub_block_ptrs(
+                    group_src,
+                    self.src_blocks_per_chunk,
+                    block_bases_src,
+                    self.src_tensors[t_idx],
+                    skip_count=src_skip_count,
+                )
+                compute_sub_block_ptrs(
+                    group_dst,
+                    self.dst_blocks_per_chunk,
+                    block_bases_dst,
+                    self.dst_tensors[t_idx],
+                    skip_count=dst_skip_count,
+                )
+            else:
+                layer_base = (
+                    self._arena.base_ptr + self._arena.layer_offsets[g_idx][ref_idx]
+                )
+                page = mapping.canonical_page_size_bytes
+                if self.gpu_to_cpu:
+                    compute_sub_block_ptrs(
+                        group_src,
+                        self.src_blocks_per_chunk,
+                        block_bases_src,
+                        self.src_tensors[t_idx],
+                        skip_count=src_skip_count,
+                    )
+                    compute_arena_ptrs(
+                        group_dst,
+                        self.dst_blocks_per_chunk,
+                        block_bases_dst,
+                        layer_base,
+                        page,
+                        skip_count=dst_skip_count,
+                    )
+                else:
+                    compute_arena_ptrs(
+                        group_src,
+                        self.src_blocks_per_chunk,
+                        block_bases_src,
+                        layer_base,
+                        page,
+                        skip_count=src_skip_count,
+                    )
+                    compute_sub_block_ptrs(
+                        group_dst,
+                        self.dst_blocks_per_chunk,
+                        block_bases_dst,
+                        self.dst_tensors[t_idx],
+                        skip_count=dst_skip_count,
+                    )
 
             # 2. On store, keep only the blocks this rank is elected to write
-            mapping = data_ref.mapping
-            assert mapping is not None
             if self.gpu_to_cpu and mapping.num_writers > 1:
                 block_bases_src, block_bases_dst = self._filter_writer_blocks(
                     block_bases_src,
                     block_bases_dst,
                     mapping,
-                    group_dst,
+                    group_cpu_ids if group_cpu_ids is not None else group_dst,
                     group_size,
                     dst_skip_count,
                 )
@@ -493,7 +601,7 @@ class SingleDirectionOffloadingHandler:
         block_bases_src: np.ndarray,
         block_bases_dst: np.ndarray,
         mapping: CanonicalPageMapping,
-        group_dst: np.ndarray,
+        cpu_slot_ids: np.ndarray,
         group_size: int,
         dst_skip_count: int,
     ) -> tuple[np.ndarray, np.ndarray]:
@@ -501,7 +609,7 @@ class SingleDirectionOffloadingHandler:
         writing shared canonical pages, keyed by the rank-consistent CPU-side
         canonical page id."""
         cpu_page_ids = _canonical_page_ids(
-            group_dst,
+            cpu_slot_ids,
             self.dst_blocks_per_chunk,
             group_size,
             dst_skip_count,
@@ -517,6 +625,20 @@ class SingleDirectionOffloadingHandler:
 
         src_blocks = src_spec.block_ids
         dst_blocks = dst_spec.block_ids
+
+        # Arena mode addresses CPU slots by byte offset; the dense slot ids
+        # stay alongside because writer rotation is keyed on them.
+        cpu_slot_ids: np.ndarray | None = None
+        if self._arena is not None:
+            cpu_spec = dst_spec if self.gpu_to_cpu else src_spec
+            assert isinstance(cpu_spec, CPULoadStoreSpec)
+            assert cpu_spec.block_offsets is not None
+            cpu_slot_ids = cpu_spec.block_ids
+            if self.gpu_to_cpu:
+                dst_blocks = cpu_spec.block_offsets
+            else:
+                src_blocks = cpu_spec.block_offsets
+
         assert src_blocks.ndim == 1
         assert dst_blocks.ndim == 1
 
@@ -594,6 +716,12 @@ class SingleDirectionOffloadingHandler:
             src_end_offset = src_offset + src_blocks_count
             assert src_end_offset <= num_src_blocks
 
+            cpu_offset, cpu_end_offset = (
+                (dst_offset, dst_end_offset)
+                if self.gpu_to_cpu
+                else (src_offset, src_end_offset)
+            )
+
             op_idx, group_bytes = self._fill_group_ops(
                 g_idx,
                 group_src=src_blocks[src_offset:src_end_offset],
@@ -605,6 +733,11 @@ class SingleDirectionOffloadingHandler:
                 all_dst=all_dst,
                 all_sizes=all_sizes,
                 op_idx=op_idx,
+                group_cpu_ids=(
+                    None
+                    if cpu_slot_ids is None
+                    else cpu_slot_ids[cpu_offset:cpu_end_offset]
+                ),
             )
             num_transfer_bytes += group_bytes
 
@@ -752,8 +885,10 @@ class CPUOffloadingWorker(OffloadingWorker):
         num_cpu_blocks: int,
         mmap_region: SharedOffloadRegion | None = None,
         canonical_layout: bool = False,
+        per_group_pools: bool = False,
     ):
         assert not canonical_layout or mmap_region is not None
+        assert not per_group_pools or (canonical_layout and mmap_region is not None)
         # The caller owns mmap_region until this constructor returns. After a
         # successful construction, the worker is the sole owner and releases
         # it after both transfer directions have stopped.
@@ -765,9 +900,19 @@ class CPUOffloadingWorker(OffloadingWorker):
 
         canonical_bytes_per_block = (
             _canonical_block_sizes(kv_caches.group_data_refs, len(kv_caches.tensors))
-            if canonical_layout
+            if canonical_layout and not per_group_pools
             else None
         )
+
+        arena: GroupArenaLayout | None = None
+        if per_group_pools:
+            assert mmap_region is not None
+            arena = GroupArenaLayout(
+                base_ptr=mmap_region.base_ptr,
+                layer_offsets=_group_layer_offsets(
+                    kv_caches.group_data_refs, blocks_per_chunk
+                ),
+            )
 
         gpu_tensors: list[torch.Tensor] = []
         cpu_tensors: list[torch.Tensor] = []
@@ -777,6 +922,10 @@ class CPUOffloadingWorker(OffloadingWorker):
                 (-1, gpu_page_size_bytes)
             )
             cpu_page_size_bytes = gpu_page_size_bytes * blocks_per_chunk
+
+            if arena is not None:
+                gpu_tensors.append(gpu_tensor)
+                continue
 
             if canonical_bytes_per_block is not None:
                 assert mmap_region is not None
@@ -811,6 +960,7 @@ class CPUOffloadingWorker(OffloadingWorker):
             layer_refs_per_group=kv_caches.group_data_refs,
             gpu_to_cpu=True,
             canonical_layout=canonical_layout,
+            arena=arena,
         )
 
         self._load_handler = SingleDirectionOffloadingHandler(
@@ -820,6 +970,7 @@ class CPUOffloadingWorker(OffloadingWorker):
             layer_refs_per_group=kv_caches.group_data_refs,
             gpu_to_cpu=False,
             canonical_layout=canonical_layout,
+            arena=arena,
         )
 
     def submit_store(

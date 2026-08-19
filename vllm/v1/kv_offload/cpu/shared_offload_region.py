@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import ctypes
 import errno
 import mmap
 import os
@@ -14,6 +15,8 @@ from vllm.distributed.device_communicators.shm_broadcast import (
 )
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
+from vllm.utils.math_utils import cdiv, round_up
+from vllm.utils.numa_utils import interleave_memory
 
 logger = init_logger(__name__)
 
@@ -83,8 +86,20 @@ class SharedOffloadRegion:
         rank: int | None,
         kv_bytes_per_block: int,
         cpu_page_size: int,
+        arena_bytes: int | None = None,
+        stripe_count: int = 1,
+        numa_interleave: bool = False,
     ) -> None:
         self.page_size = mmap.PAGESIZE
+
+        # Arena mode: one flat byte region addressed by explicit offsets
+        # instead of a grid of fixed-width per-worker slots. Used by per-group
+        # pools, where each KV cache group's row has its own width.
+        self.is_arena = arena_bytes is not None
+        if arena_bytes is not None:
+            num_blocks = 1
+            kv_bytes_per_block = arena_bytes
+            cpu_page_size = arena_bytes
         assert kv_bytes_per_block % self.page_size == 0
 
         self.num_blocks = num_blocks
@@ -94,7 +109,9 @@ class SharedOffloadRegion:
         self.mmap_path = f"/dev/shm/vllm_offload_{engine_id}.mmap"
         self._creator = False  # set True only if this worker creates the file
         self.rank = rank
-        if rank is not None:
+        self._worker_offset = 0
+        self._worker_area_end = 0
+        if rank is not None and not self.is_arena:
             # byte offset to this worker's first slot within each block row
             self._worker_offset = rank * cpu_page_size
             # exclusive upper bound for this worker's area within each row
@@ -141,7 +158,29 @@ class SharedOffloadRegion:
 
         populate_write_fn = _get_populate_write_fn(self.mmap_obj)
 
-        if rank is not None:
+        if self.is_arena:
+            if numa_interleave:
+                self._interleave_pages()
+            # Every rank reads the whole arena, and with deduplicated pages
+            # they also write into each other's stripes, so first touch no
+            # longer distributes the region. Split the fault-in work by rank
+            # to divide the startup cost, and rely on the interleave policy
+            # above for placement.
+            stripe = round_up(
+                cdiv(self.total_size_bytes, max(stripe_count, 1)), self.page_size
+            )
+            start = min((rank or 0) * stripe, self.total_size_bytes)
+            length = min(stripe, self.total_size_bytes - start)
+            _t0 = time.perf_counter()
+            if length > 0:
+                populate_write_fn(self.mmap_obj, start, length)
+            logger.debug(
+                "Populated arena stripe [%d, %d) in %.3f s",
+                start,
+                start + length,
+                time.perf_counter() - _t0,
+            )
+        elif rank is not None:
             # Populate only this worker's pages (one slot per block row).
             worker_offset = rank * cpu_page_size
             _t0 = time.perf_counter()
@@ -169,6 +208,38 @@ class SharedOffloadRegion:
         self._views: list[torch.Tensor] = []
         self._canonical_offset = 0
         self.is_pinned: bool = False
+
+    def _interleave_pages(self) -> None:
+        """Spread the arena's pages across NUMA nodes before they are faulted.
+
+        Nothing else in the offload path binds host memory, so placement is
+        first touch. That is harmless while each rank owns a private slot, but
+        a deduplicated page is read by every rank, and leaving the whole region
+        on whichever node faulted it first turns the capacity win into a
+        single memory controller's bandwidth limit.
+        """
+        assert self.mmap_obj is not None
+        buf = (ctypes.c_char * self.total_size_bytes).from_buffer(self.mmap_obj)
+        ptr = ctypes.addressof(buf)
+        applied = interleave_memory(ptr, self.total_size_bytes)
+        del buf
+        if applied:
+            logger.info(
+                "Interleaved offload arena (%.2f GB) across NUMA nodes",
+                self.total_size_bytes / 1e9,
+            )
+        else:
+            logger.warning(
+                "Could not apply MPOL_INTERLEAVE to the offload arena; host "
+                "pages will land on whichever NUMA node faults them in first, "
+                "which can bottleneck deduplicated reads."
+            )
+
+    @property
+    def base_ptr(self) -> int:
+        """Address of the first arena byte."""
+        assert self._base is not None
+        return self._base.data_ptr()
 
     def create_next_worker_view(self, tensor_page_size: int) -> torch.Tensor:
         """Allocate a strided int8 view for this worker, one canonical tensor.

@@ -84,3 +84,13 @@ class OffloadingConfig:
     # True when the canonical per-layer host byte layout was requested via
     # kv_connector_extra_config; certified per-layer at worker registration.
     canonical_layout: bool = False
+    # Canonical host bytes per GPU block for each KV cache group: the sum over
+    # the group's layers of that layer's canonical page size. This is what a
+    # host row for the group actually needs, as opposed to
+    # worker_kv_bytes_per_block * world_size, which both replicates KV that is
+    # identical on every rank and pads every group to the widest one.
+    # None when the canonical layout could not be derived for every layer.
+    group_canonical_bytes_per_block: tuple[int, ...] | None = None
+    # True when the host pool is split into one variable-width pool per KV
+    # cache group, sized from group_canonical_bytes_per_block.
+    per_group_pools: bool = False

@@ -4,6 +4,7 @@
 
 from typing import TYPE_CHECKING
 
+from vllm.logger import init_logger
 from vllm.v1.core.kv_cache_utils import resolve_kv_cache_block_sizes
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
@@ -22,10 +23,49 @@ if TYPE_CHECKING:
     from vllm.config import VllmConfig
     from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheTensor
 
+logger = init_logger(__name__)
+
 
 def is_kv_cache_tensor_packed(kv_cache_tensor: "KVCacheTensor") -> bool:
     """Return whether a KV cache tensor uses a packed block stride."""
     return bool(kv_cache_tensor.block_stride)
+
+
+def _group_canonical_bytes_per_block(
+    vllm_config: "VllmConfig",
+    kv_cache_config: "KVCacheConfig",
+) -> tuple[int, ...] | None:
+    """Canonical host bytes one block of each KV cache group needs.
+
+    Derived from the same per-layer canonical mappings the worker uses, but
+    from specs alone (no live tensors), so the scheduler and every worker
+    agree on the host layout. Without tensors the head-sharded attention
+    branch cannot be certified and falls back to the opaque per-rank page,
+    which is the width used today — the derivation can only under-deduplicate,
+    never over-deduplicate.
+
+    Returns None if any layer has no canonical mapping.
+    """
+    # Imported here: canonical_mapping imports torch, and this module is
+    # reached from the scheduler process during engine startup.
+    from vllm.distributed.kv_transfer.kv_connector.v1.offloading.canonical_mapping import (  # noqa: E501
+        derive_canonical_mappings,
+    )
+
+    mappings = derive_canonical_mappings(vllm_config, kv_cache_config, {})
+    if not mappings:
+        return None
+
+    per_group: list[int] = []
+    for kv_cache_group in kv_cache_config.kv_cache_groups:
+        group_bytes = 0
+        for layer_name in kv_cache_group.layer_names:
+            mapping = mappings.get(layer_name)
+            if mapping is None:
+                return None
+            group_bytes += mapping.canonical_page_size_bytes
+        per_group.append(group_bytes)
+    return tuple(per_group)
 
 
 def build_offloading_config(
@@ -136,6 +176,37 @@ def build_offloading_config(
     )
 
     canonical_layout = bool(extra_config.get("canonical_layout", False))
+    per_group_pools = bool(extra_config.get("per_group_cpu_pools", False))
+
+    group_canonical_bytes_per_block: tuple[int, ...] | None = None
+    if canonical_layout and not any(
+        is_kv_cache_tensor_packed(tensor) for tensor in kv_cache_config.kv_cache_tensors
+    ):
+        group_canonical_bytes_per_block = _group_canonical_bytes_per_block(
+            vllm_config, kv_cache_config
+        )
+
+    if per_group_pools:
+        if not canonical_layout:
+            raise ValueError(
+                "per_group_cpu_pools requires canonical_layout in "
+                "kv_connector_extra_config."
+            )
+        if group_canonical_bytes_per_block is None:
+            raise ValueError(
+                "per_group_cpu_pools was requested but the canonical host "
+                "layout could not be derived for every layer (offload workers "
+                "must be exactly the TP x PCP grid, and packed / cross-layer "
+                "KV layouts are not supported)."
+            )
+        direct_bytes_per_block = worker_kv_bytes_per_block * parallel_config.world_size
+        logger.info(
+            "Per-group CPU offload pools: host bytes per block %s (direct: %s "
+            "per group), groups=%s",
+            group_canonical_bytes_per_block,
+            direct_bytes_per_block,
+            len(kv_cache_config.kv_cache_groups),
+        )
 
     # Only a single non-MLA full-attention group with genuinely head-sharded
     # pages is parallelism-invariant: replicated latent or GQA heads,
@@ -219,4 +290,6 @@ def build_offloading_config(
         ),
         replicated_layout=replicated_layout,
         canonical_layout=canonical_layout,
+        group_canonical_bytes_per_block=group_canonical_bytes_per_block,
+        per_group_pools=per_group_pools,
     )
