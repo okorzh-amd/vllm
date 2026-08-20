@@ -464,6 +464,7 @@ def test_pin_failure_raises_instead_of_warning():
     failure = MagicMock()
     failure.value = 1
 
+    region.pinned_chunks = []
     cudart = MagicMock()
     cudart.cudaHostRegister.return_value = failure
     with (
@@ -473,3 +474,35 @@ def test_pin_failure_raises_instead_of_warning():
     ):
         gw.pin_mmap_region(region)
     assert region.is_pinned is not True
+    assert region.pinned_chunks == []
+
+
+def test_pin_registers_in_chunks_and_records_each():
+    """A single cudaHostRegister call caps out well below host DRAM, but the
+    cap is per call, so a large tier is registered piecewise. Every chunk has
+    to be recorded, or cleanup unregisters only the first."""
+    from unittest.mock import MagicMock, patch
+
+    from vllm.v1.kv_offload.cpu import gpu_worker as gw
+
+    chunk = gw._HOST_REGISTER_CHUNK_BYTES
+    region = MagicMock()
+    region.rank = 0
+    region.total_size_bytes = chunk * 2 + 1024
+    region._base.data_ptr.return_value = 0x1000
+    region.pinned_chunks = []
+
+    ok = MagicMock()
+    ok.value = 0
+    cudart = MagicMock()
+    cudart.cudaHostRegister.return_value = ok
+    with (
+        patch.object(gw.current_platform, "is_cuda_alike", return_value=True),
+        patch.object(gw.torch.cuda, "cudart", return_value=cudart),
+    ):
+        gw.pin_mmap_region(region)
+
+    sizes = [c.args[1] for c in cudart.cudaHostRegister.call_args_list]
+    assert sizes == [chunk, chunk, 1024], "must cover the region exactly"
+    assert region.pinned_chunks == [0x1000, 0x1000 + chunk, 0x1000 + 2 * chunk]
+    assert region.is_pinned is True

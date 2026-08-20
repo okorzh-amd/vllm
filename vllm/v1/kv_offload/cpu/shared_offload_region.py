@@ -208,6 +208,9 @@ class SharedOffloadRegion:
         self._views: list[torch.Tensor] = []
         self._canonical_offset = 0
         self.is_pinned: bool = False
+        # Base pointers of each successfully registered chunk, so cleanup can
+        # unregister exactly what pin_mmap_region registered.
+        self.pinned_chunks: list[int] = []
 
     def _interleave_pages(self) -> None:
         """Spread the arena's pages across NUMA nodes before they are faulted.
@@ -341,14 +344,19 @@ class SharedOffloadRegion:
     def cleanup(self) -> None:
         if self.is_pinned and self._base is not None:
             if current_platform.is_cuda_alike():
-                base_ptr = self._base.data_ptr()
-                result = torch.cuda.cudart().cudaHostUnregister(base_ptr)
-                if result.value != 0:
-                    logger.warning(
-                        "cudaHostUnregister failed for rank=%d (code=%d)",
-                        self.rank,
-                        result,
-                    )
+                # One unregister per register: the region is pinned in chunks
+                # (see pin_mmap_region), and each chunk is its own mapping.
+                for chunk_ptr in self.pinned_chunks or [self._base.data_ptr()]:
+                    result = torch.cuda.cudart().cudaHostUnregister(chunk_ptr)
+                    if result.value != 0:
+                        logger.warning(
+                            "cudaHostUnregister failed for rank=%d at %#x "
+                            "(code=%d)",
+                            self.rank,
+                            chunk_ptr,
+                            result,
+                        )
+            self.pinned_chunks = []
             self.is_pinned = False
         # Release views before _base: each view holds a _base reference and a
         # direct StorageImpl reference.  Freeing views first lets both refcounts

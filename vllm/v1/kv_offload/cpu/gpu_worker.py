@@ -247,6 +247,12 @@ def _canonical_block_sizes(
     return canonical_bytes_per_block
 
 
+# Per-call cudaHostRegister ceiling is device/driver specific; 64 GB sits an
+# order of magnitude under the smallest failure observed (between 378 GB and
+# 1,199 GB on MI355X) while keeping the call count low.
+_HOST_REGISTER_CHUNK_BYTES = 64 * 1024**3
+
+
 def pin_mmap_region(region: SharedOffloadRegion) -> None:
     """Register the entire mmap as CUDA pinned memory via cudaHostRegister."""
     if not current_platform.is_cuda_alike():
@@ -260,8 +266,33 @@ def pin_mmap_region(region: SharedOffloadRegion) -> None:
     rank = region.rank
 
     base_ptr = region._base.data_ptr()
-    result = torch.cuda.cudart().cudaHostRegister(base_ptr, region.total_size_bytes, 0)
+    cudart = torch.cuda.cudart()
+
+    # Register in chunks. The driver caps a single cudaHostRegister call well
+    # below host DRAM -- measured on MI355X/ROCm 7.2, 378 GB in one call
+    # succeeds and 1,199 GB does not -- but the cap is per call, not
+    # cumulative: the same 8 x 128 GB registered as separate calls reaches
+    # 1,024 GB. Chunking is what lets a host tier larger than that per-call
+    # ceiling be pinned at all.
+    remaining = region.total_size_bytes
+    offset = 0
+    result = None
+    while remaining > 0:
+        length = min(remaining, _HOST_REGISTER_CHUNK_BYTES)
+        result = cudart.cudaHostRegister(base_ptr + offset, length, 0)
+        if result.value != 0:
+            break
+        region.pinned_chunks.append(base_ptr + offset)
+        offset += length
+        remaining -= length
+
+    assert result is not None
     if result.value != 0:
+        # Undo the chunks that did register, so the failure path does not leave
+        # the region half-pinned.
+        for chunk_ptr in region.pinned_chunks:
+            cudart.cudaHostUnregister(chunk_ptr)
+        region.pinned_chunks.clear()
         # Not survivable, despite what the old warning here claimed. A failed
         # registration leaves the device context in a state where the next
         # allocation fails too: on ROCm at a 1.2 TB tier every rank reports
@@ -269,14 +300,14 @@ def pin_mmap_region(region: SharedOffloadRegion) -> None:
         # same hipErrorInvalidValue, from a dummy-run tensor that has nothing
         # to do with offloading. Failing here names the actual cause.
         raise RuntimeError(
-            f"cudaHostRegister failed for rank={rank} (code={result.value}) on "
-            f"a {region.total_size_bytes / 1e9:.2f} GB host KV tier. The tier "
-            f"is registered whole, so it must fit what the driver can map in "
-            f"one call, which is well below host DRAM. Lower "
-            f"cpu_bytes_to_use, raise the container's memlock limit "
-            f"(docker --ulimit memlock=-1; the default 64 KiB fails "
-            f"immediately), or disable host pinning entirely if unpinned DMA "
-            f"is acceptable on this platform."
+            f"cudaHostRegister failed for rank={rank} (code={result.value}) "
+            f"at offset {offset} of a {region.total_size_bytes / 1e9:.2f} GB "
+            f"host KV tier, registering in "
+            f"{_HOST_REGISTER_CHUNK_BYTES / 1024**3:.0f} GiB chunks. Raise the "
+            f"container's memlock limit (docker --ulimit memlock=-1; the "
+            f"default 64 KiB fails on the first chunk), lower "
+            f"cpu_bytes_to_use, or disable host pinning if unpinned DMA is "
+            f"acceptable on this platform."
         )
     else:
         logger.debug(
