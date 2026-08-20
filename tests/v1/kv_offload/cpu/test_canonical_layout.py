@@ -447,3 +447,29 @@ def test_per_group_store_rotates_writers_over_slots():
             assert written == (slot % 2 == 0), f"slot {slot}"
     finally:
         region.cleanup()
+
+
+def test_pin_failure_raises_instead_of_warning():
+    """A failed cudaHostRegister poisons the device context -- the next
+    allocation fails too, and the engine dies far from the cause in
+    compile_or_warm_up_model. Fail here, where the tier size is nameable."""
+    from unittest.mock import MagicMock, patch
+
+    from vllm.v1.kv_offload.cpu import gpu_worker as gw
+
+    region = MagicMock()
+    region.rank = 3
+    region.total_size_bytes = 1_198_000_000_000
+    region._base.data_ptr.return_value = 0x1000
+    failure = MagicMock()
+    failure.value = 1
+
+    cudart = MagicMock()
+    cudart.cudaHostRegister.return_value = failure
+    with (
+        patch.object(gw.current_platform, "is_cuda_alike", return_value=True),
+        patch.object(gw.torch.cuda, "cudart", return_value=cudart),
+        pytest.raises(RuntimeError, match="cpu_bytes_to_use"),
+    ):
+        gw.pin_mmap_region(region)
+    assert region.is_pinned is not True

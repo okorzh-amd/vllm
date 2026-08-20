@@ -262,11 +262,21 @@ def pin_mmap_region(region: SharedOffloadRegion) -> None:
     base_ptr = region._base.data_ptr()
     result = torch.cuda.cudart().cudaHostRegister(base_ptr, region.total_size_bytes, 0)
     if result.value != 0:
-        logger.warning(
-            "cudaHostRegister failed for rank=%d (code=%d) — "
-            "transfers will still work but may be slower (unpinned DMA)",
-            rank,
-            result,
+        # Not survivable, despite what the old warning here claimed. A failed
+        # registration leaves the device context in a state where the next
+        # allocation fails too: on ROCm at a 1.2 TB tier every rank reports
+        # code=1 and the engine then dies in compile_or_warm_up_model with the
+        # same hipErrorInvalidValue, from a dummy-run tensor that has nothing
+        # to do with offloading. Failing here names the actual cause.
+        raise RuntimeError(
+            f"cudaHostRegister failed for rank={rank} (code={result.value}) on "
+            f"a {region.total_size_bytes / 1e9:.2f} GB host KV tier. The tier "
+            f"is registered whole, so it must fit what the driver can map in "
+            f"one call, which is well below host DRAM. Lower "
+            f"cpu_bytes_to_use, raise the container's memlock limit "
+            f"(docker --ulimit memlock=-1; the default 64 KiB fails "
+            f"immediately), or disable host pinning entirely if unpinned DMA "
+            f"is acceptable on this platform."
         )
     else:
         logger.debug(
