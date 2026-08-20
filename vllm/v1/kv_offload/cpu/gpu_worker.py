@@ -268,12 +268,18 @@ def pin_mmap_region(region: SharedOffloadRegion) -> None:
     base_ptr = region._base.data_ptr()
     cudart = torch.cuda.cudart()
 
-    # Register in chunks. The driver caps a single cudaHostRegister call well
-    # below host DRAM -- measured on MI355X/ROCm 7.2, 378 GB in one call
-    # succeeds and 1,199 GB does not -- but the cap is per call, not
-    # cumulative: the same 8 x 128 GB registered as separate calls reaches
-    # 1,024 GB. Chunking is what lets a host tier larger than that per-call
-    # ceiling be pinned at all.
+    # Register in chunks. A single cudaHostRegister call caps out well below
+    # host DRAM -- measured on MI355X/ROCm 7.2, 378 GB in one call succeeds and
+    # 1,199 GB does not -- and chunking lifts that particular limit: one
+    # process pins a 1,199 GB region fine in 64 GiB pieces.
+    #
+    # It does NOT lift the limit that actually binds a TP deployment. Every
+    # rank registers the whole shared region independently, and those
+    # registrations are accounted separately, so what has to fit is
+    # tier_size * world_size, not tier_size. On the same box at TP8 the ranks
+    # got 320-384 GiB each before failing, summing to roughly host RAM. Size
+    # the tier at about host_ram / world_size; chunking only changes where the
+    # failure lands, not whether it happens.
     remaining = region.total_size_bytes
     offset = 0
     result = None
