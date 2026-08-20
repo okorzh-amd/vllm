@@ -805,3 +805,46 @@ def test_group_rows_are_absent_without_canonical_layout():
     )
     assert offloading_config.group_canonical_bytes_per_block is None
     assert not offloading_config.per_group_pools
+
+
+def _speculative_config(use_eagle: bool = True) -> MagicMock:
+    spec = MagicMock()
+    spec.use_eagle.return_value = use_eagle
+    return spec
+
+
+def test_eagle_fallback_does_not_flag_recurrent_groups():
+    """A draft model has no recurrent layers, so the unannotated-draft fallback
+    must not mark a Mamba group as EAGLE. Flagging it raises its lookup window
+    from one chunk to two adjacent ones, which align mode never stores, and
+    min-across-groups then drives every external lookup to zero."""
+    config = _make_vllm_config()
+    config.speculative_config = _speculative_config()
+    kv_cache_config = _make_mamba_hybrid_kv_cache_config()
+
+    scheduler_config = SchedulerOffloadConfig.from_spec(
+        MockOffloadingSpec(build_offloading_config(config, kv_cache_config)),
+        config,
+        kv_cache_config,
+    )
+
+    full_attn, mamba = scheduler_config.kv_group_configs
+    assert full_attn.is_eagle_group, "attention groups still take the fallback"
+    assert not mamba.is_eagle_group
+
+    # The window the lookup will demand: one chunk, not two.
+    assert mamba.sliding_window_size_in_chunks == 1
+
+
+def test_eagle_fallback_still_flags_attention_only_models():
+    config = _make_vllm_config()
+    config.speculative_config = _speculative_config()
+    kv_cache_config = _make_kv_cache_config()
+
+    scheduler_config = SchedulerOffloadConfig.from_spec(
+        MockOffloadingSpec(build_offloading_config(config, kv_cache_config)),
+        config,
+        kv_cache_config,
+    )
+
+    assert all(g.is_eagle_group for g in scheduler_config.kv_group_configs)

@@ -228,7 +228,22 @@ class SchedulerOffloadConfig(NamedTuple):
             and vllm_config.speculative_config.use_eagle()
         )
         if use_eagle and not eagle_groups:
-            eagle_groups = set(range(len(kv_cache_config.kv_cache_groups)))
+            # Fallback for configs that do not annotate the draft group: assume
+            # every *attention* group may be one. Recurrent groups are excluded,
+            # and that exclusion is load-bearing rather than cosmetic. A draft
+            # model has no recurrent layers, so a recurrent group can never be
+            # an EAGLE draft group; flagging it anyway raises its lookup window
+            # from one chunk to two *adjacent* chunks, which align mode never
+            # stores, so the group can never hit and min-across-groups drives
+            # the whole request's external lookup to zero. The GPU-local
+            # coordinator already exempts recurrent groups from the same
+            # trailing-chunk drop (`not isinstance(spec, MambaSpec)`); this is
+            # the offload path's half of that guard.
+            eagle_groups = {
+                idx
+                for idx, g in enumerate(kv_cache_config.kv_cache_groups)
+                if not isinstance(g.kv_cache_spec, MambaSpec)
+            }
 
         if eagle_groups:
             logger.info(
