@@ -31,6 +31,7 @@ from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
 from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
 from vllm.multimodal.encoder_budget import MultiModalBudget
 from vllm.multimodal.utils import get_mm_features_in_window
+from vllm.utils.math_utils import cdiv, round_down
 from vllm.v1.core.encoder_cache_manager import (
     EncoderCacheManager,
     EncoderDecoderCacheManager,
@@ -55,6 +56,8 @@ from vllm.v1.core.sched.request_queue import (
 from vllm.v1.core.sched.utils import check_stop, remove_all
 from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs
 from vllm.v1.kv_cache_interface import (
+    CrossAttentionSpec,
+    EncoderOnlyAttentionSpec,
     KVCacheConfig,
     MambaSpec,
     get_mamba_prefill_checkpoint_position,
@@ -316,6 +319,30 @@ class Scheduler(SchedulerInterface):
                 self.cache_config.enable_mamba_fine_grained_prefix_cache
             ),
         )
+        # Token span of one block in each KV cache group, in group order, or
+        # None where a block index is not a decoder-token position: cross- and
+        # encoder-only attention index encoder positions, and a non prefix
+        # cacheable group holds a fixed-size scratch ring rather than a prefix.
+        # Read the span from the manager, not the spec: the manager folds in
+        # the DCP scaling that widens a block to block_size * dcp_world_size
+        # tokens. Used by _update_requests_with_invalid_blocks.
+        self.invalid_block_group_sizes: list[int | None] = []
+        for group, manager in zip(
+            kv_cache_config.kv_cache_groups,
+            self.kv_cache_manager.coordinator.single_type_managers,
+            strict=True,
+        ):
+            spec = group.kv_cache_spec
+            if not spec.prefix_cacheable or isinstance(
+                spec, (CrossAttentionSpec, EncoderOnlyAttentionSpec)
+            ):
+                self.invalid_block_group_sizes.append(None)
+                continue
+            # Holds by construction (resolve_kv_cache_block_sizes takes the LCM
+            # of the same DCP-scaled sizes), and makes the eviction index exact.
+            assert self.block_size % manager.block_size == 0
+            self.invalid_block_group_sizes.append(manager.block_size)
+
         # Bind GPU block pool to the KV connector. This must happen after
         # kv_cache_manager is constructed so block_pool is available.
         if self.connector is not None:
@@ -3041,6 +3068,13 @@ class Scheduler(SchedulerInterface):
         For observability, it also accumulates the total number of tokens that
         will need to be recomputed across all affected requests.
 
+        A token is computed only if every KV cache group holds valid KV for it,
+        so each group is scanned with its own block size and the request is
+        rewound to the earliest invalid token position found in any group. That
+        position is rounded down to `self.block_size`, the LCM of the group
+        block sizes, so the resume point is block aligned in every group, and
+        every group is then evicted from that common point.
+
         Args:
             requests: The set of requests to scan for invalid blocks.
             invalid_block_ids: IDs of invalid blocks.
@@ -3060,6 +3094,10 @@ class Scheduler(SchedulerInterface):
         affected_req_ids: set[str] = set()
         total_affected_tokens = 0
         blocks_to_evict: set[int] = set()
+        # A sparse group parks a dropped prefix on the shared null block, so it
+        # repeats within a group, across groups and across requests. It holds
+        # no tokens and is never a real load destination.
+        null_block_id = self.kv_cache_manager.block_pool.null_block.block_id
         # If a block is invalid and shared by multiple requests in the batch,
         # these requests must be rescheduled, but only the first will recompute
         # it. This set tracks blocks already marked for recomputation.
@@ -3068,64 +3106,99 @@ class Scheduler(SchedulerInterface):
             is_affected = False
             marked_invalid_block = False
             req_id = request.request_id
-            # TODO (davidb): add support for hybrid memory allocator
-            (req_block_ids,) = self.kv_cache_manager.get_block_ids(req_id)
+            req_block_ids_per_group = self.kv_cache_manager.get_block_ids(req_id)
             # We iterate only over blocks that may contain externally computed
             # tokens
             req_num_computed_tokens = (
                 request.num_computed_tokens - num_scheduled_tokens.get(req_id, 0)
             )
+            # Earliest invalid token position over all groups.
+            rewind_num_computed_tokens = req_num_computed_tokens
 
-            req_num_computed_blocks = (
-                req_num_computed_tokens + self.block_size - 1
-            ) // self.block_size
-            for idx, block_id in zip(range(req_num_computed_blocks), req_block_ids):
-                if block_id not in invalid_block_ids:
+            for group_block_size, req_block_ids in zip(
+                self.invalid_block_group_sizes,
+                req_block_ids_per_group,
+                strict=True,
+            ):
+                if group_block_size is None:
+                    # This group's block index is not a token position, so it
+                    # carries no externally computed prefix to rewind.
                     continue
 
-                is_affected = True
-
-                if block_id in marked_invalid_block_ids:
-                    # This invalid block is shared with a previous request
-                    # and was already marked for recomputation.
-                    # This means this request can still consider this block
-                    # as computed when rescheduled.
-                    # Currently this only applies to sync loading; Async
-                    # loading does not yet support block sharing
-                    continue
-
-                marked_invalid_block_ids.add(block_id)
-
-                if marked_invalid_block:
-                    # This request has already marked an invalid block for
-                    # recomputation and updated its num_computed_tokens.
-                    continue
-
-                marked_invalid_block = True
-                # Truncate the computed tokens at the first failed block
-                request.num_computed_tokens = idx * self.block_size
-                num_affected_tokens = (
-                    req_num_computed_tokens - request.num_computed_tokens
+                req_num_computed_blocks = cdiv(
+                    req_num_computed_tokens, group_block_size
                 )
-                total_affected_tokens += num_affected_tokens
+                for idx, block_id in zip(range(req_num_computed_blocks), req_block_ids):
+                    if block_id == null_block_id:
+                        continue
 
-                # collect invalid block and all downstream dependent blocks
-                if evict_blocks:
-                    blocks_to_evict.update(req_block_ids[idx:])
+                    if block_id not in invalid_block_ids:
+                        continue
 
-            if is_affected:
-                if not marked_invalid_block:
-                    # All invalid blocks of this request are shared with
-                    # previous requests and will be recomputed by them.
-                    # Revert to considering only cached tokens as computed.
-                    # Currently this only applies to sync loading; Async
-                    # loading does not yet support block sharing
-                    total_affected_tokens += (
-                        request.num_computed_tokens - req_num_computed_tokens
+                    is_affected = True
+
+                    if block_id in marked_invalid_block_ids:
+                        # This invalid block is shared with a previous request
+                        # and was already marked for recomputation.
+                        # This means this request can still consider this block
+                        # as computed when rescheduled.
+                        # Currently this only applies to sync loading; Async
+                        # loading does not yet support block sharing
+                        continue
+
+                    marked_invalid_block_ids.add(block_id)
+                    marked_invalid_block = True
+                    # Truncate the computed tokens at the first failed block,
+                    # taking the earliest one over all groups.
+                    rewind_num_computed_tokens = min(
+                        rewind_num_computed_tokens, idx * group_block_size
                     )
-                    request.num_computed_tokens = req_num_computed_tokens
 
-                affected_req_ids.add(request.request_id)
+            if not is_affected:
+                continue
+
+            if marked_invalid_block:
+                # Resume on a boundary shared by every group: a group whose
+                # blocks are wider than the failing group's must not restart
+                # inside a block, and record_blocks_for_zeroing asserts the
+                # same alignment.
+                rewind_num_computed_tokens = round_down(
+                    rewind_num_computed_tokens, self.block_size
+                )
+                total_affected_tokens += (
+                    req_num_computed_tokens - rewind_num_computed_tokens
+                )
+                request.num_computed_tokens = rewind_num_computed_tokens
+
+                # collect invalid blocks and all downstream dependent blocks in
+                # every group: everything from the resume point on is about to
+                # be recomputed
+                if evict_blocks:
+                    for group_block_size, req_block_ids in zip(
+                        self.invalid_block_group_sizes,
+                        req_block_ids_per_group,
+                        strict=True,
+                    ):
+                        if group_block_size is None:
+                            continue
+                        first_idx = rewind_num_computed_tokens // group_block_size
+                        blocks_to_evict.update(
+                            block_id
+                            for block_id in req_block_ids[first_idx:]
+                            if block_id != null_block_id
+                        )
+            else:
+                # All invalid blocks of this request are shared with
+                # previous requests and will be recomputed by them.
+                # Revert to considering only cached tokens as computed.
+                # Currently this only applies to sync loading; Async
+                # loading does not yet support block sharing
+                total_affected_tokens += (
+                    request.num_computed_tokens - req_num_computed_tokens
+                )
+                request.num_computed_tokens = req_num_computed_tokens
+
+            affected_req_ids.add(req_id)
 
         return affected_req_ids, total_affected_tokens, blocks_to_evict
 
