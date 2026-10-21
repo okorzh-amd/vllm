@@ -411,6 +411,7 @@ steps:
   - vllm/v1/worker/gpu/model_states/
   - vllm/v1/worker/gpu/cudagraph_utils.py
   - vllm/v1/attention/backends/rocm_aiter_fa.py
+  - vllm/third_party/flash_linear_attention/ops/kda.py
   - tests/models/muse_spark/
   - tests/kernels/attention/test_rocm_aiter_fa.py
   commands:

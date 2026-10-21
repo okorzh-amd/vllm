@@ -1,0 +1,215 @@
+{
+ "builds": {
+  "muse_mono_k2_s1": {
+   "key": {
+    "debug_dump": false,
+    "fault_epoch": 0,
+    "fault_rank": -1,
+    "fault_slot": 0,
+    "fault_ticks": 0,
+    "tokens": 1
+   },
+   "resources": {
+    "accum_offset": 228,
+    "group_segment_fixed_size": 17216,
+    "next_free_sgpr": 100,
+    "next_free_vgpr": 226,
+    "private_segment_fixed_size": 0
+   },
+   "sha256": "625e13d29c71330a02f588314a29bdffe9f4f3ff43553af97c6d7ab8269ac6f2"
+  },
+  "muse_mono_k2_s1_f3_2_129_1500000000": {
+   "key": {
+    "debug_dump": false,
+    "fault_epoch": 2,
+    "fault_rank": 3,
+    "fault_slot": 129,
+    "fault_ticks": 1500000000,
+    "tokens": 1
+   },
+   "resources": {
+    "accum_offset": 228,
+    "group_segment_fixed_size": 17216,
+    "next_free_sgpr": 100,
+    "next_free_vgpr": 226,
+    "private_segment_fixed_size": 0
+   },
+   "sha256": "56780e0f437b2ab48b9bb5581661adb13488c1204f00d953ccfc7a49bd83d5aa"
+  },
+  "muse_mono_k2_s2": {
+   "key": {
+    "debug_dump": false,
+    "fault_epoch": 0,
+    "fault_rank": -1,
+    "fault_slot": 0,
+    "fault_ticks": 0,
+    "tokens": 2
+   },
+   "resources": {
+    "accum_offset": 236,
+    "group_segment_fixed_size": 20320,
+    "next_free_sgpr": 100,
+    "next_free_vgpr": 233,
+    "private_segment_fixed_size": 0
+   },
+   "sha256": "caa591e1afcefa621a774e72f98c06669be27e8a9127a04cf2abfe8e4418abcc"
+  },
+  "muse_mono_k2_s3": {
+   "key": {
+    "debug_dump": false,
+    "fault_epoch": 0,
+    "fault_rank": -1,
+    "fault_slot": 0,
+    "fault_ticks": 0,
+    "tokens": 3
+   },
+   "resources": {
+    "accum_offset": 232,
+    "group_segment_fixed_size": 24432,
+    "next_free_sgpr": 100,
+    "next_free_vgpr": 232,
+    "private_segment_fixed_size": 0
+   },
+   "sha256": "46922fc31d1c01d2985cecbe5f95df91ff421cca8281e04719c27995b343ca09"
+  },
+  "muse_mono_k2_s4": {
+   "key": {
+    "debug_dump": false,
+    "fault_epoch": 0,
+    "fault_rank": -1,
+    "fault_slot": 0,
+    "fault_ticks": 0,
+    "tokens": 4
+   },
+   "resources": {
+    "accum_offset": 232,
+    "group_segment_fixed_size": 28544,
+    "next_free_sgpr": 100,
+    "next_free_vgpr": 231,
+    "private_segment_fixed_size": 0
+   },
+   "sha256": "8552b3cf3694d9c7746c3d735183196deb7566d404189d100860b3549cacb641"
+  },
+  "muse_mono_k2_s5": {
+   "key": {
+    "debug_dump": false,
+    "fault_epoch": 0,
+    "fault_rank": -1,
+    "fault_slot": 0,
+    "fault_ticks": 0,
+    "tokens": 5
+   },
+   "resources": {
+    "accum_offset": 232,
+    "group_segment_fixed_size": 32656,
+    "next_free_sgpr": 100,
+    "next_free_vgpr": 231,
+    "private_segment_fixed_size": 0
+   },
+   "sha256": "f0ae703d0951d2a846bd6d77b7533728135f74da9c5a142fbaf9480081da014e"
+  },
+  "muse_mono_k2_s6": {
+   "key": {
+    "debug_dump": false,
+    "fault_epoch": 0,
+    "fault_rank": -1,
+    "fault_slot": 0,
+    "fault_ticks": 0,
+    "tokens": 6
+   },
+   "resources": {
+    "accum_offset": 232,
+    "group_segment_fixed_size": 36768,
+    "next_free_sgpr": 100,
+    "next_free_vgpr": 231,
+    "private_segment_fixed_size": 0
+   },
+   "sha256": "0fea5eda59ff602a5886b038752a51de8420452383c9e6caacf5696d0215814a"
+  },
+  "muse_mono_k2_s7": {
+   "key": {
+    "debug_dump": false,
+    "fault_epoch": 0,
+    "fault_rank": -1,
+    "fault_slot": 0,
+    "fault_ticks": 0,
+    "tokens": 7
+   },
+   "resources": {
+    "accum_offset": 232,
+    "group_segment_fixed_size": 40880,
+    "next_free_sgpr": 100,
+    "next_free_vgpr": 232,
+    "private_segment_fixed_size": 0
+   },
+   "sha256": "a0bf72f7960fffc0aab6ee9f15a826152d8eb5e43a8d49341dec68c84e7e463b"
+  },
+  "muse_mono_k2_s8": {
+   "key": {
+    "debug_dump": false,
+    "fault_epoch": 0,
+    "fault_rank": -1,
+    "fault_slot": 0,
+    "fault_ticks": 0,
+    "tokens": 8
+   },
+   "resources": {
+    "accum_offset": 232,
+    "group_segment_fixed_size": 44992,
+    "next_free_sgpr": 100,
+    "next_free_vgpr": 232,
+    "private_segment_fixed_size": 0
+   },
+   "sha256": "c18befe3c4dccde2f0996189023282564ccbf2cc8ac33d2e6945255769344580"
+  },
+  "muse_mono_k2_s8_dbg": {
+   "key": {
+    "debug_dump": true,
+    "fault_epoch": 0,
+    "fault_rank": -1,
+    "fault_slot": 0,
+    "fault_ticks": 0,
+    "tokens": 8
+   },
+   "resources": {
+    "accum_offset": 232,
+    "group_segment_fixed_size": 44992,
+    "next_free_sgpr": 100,
+    "next_free_vgpr": 232,
+    "private_segment_fixed_size": 0
+   },
+   "sha256": "cd9ab9336b4fb652bf745cd8043e9310f1e6d4d4ce2512d189e27d37b66059f5"
+  },
+  "muse_mono_k2_s8_f3_2_129_1500000000": {
+   "key": {
+    "debug_dump": false,
+    "fault_epoch": 2,
+    "fault_rank": 3,
+    "fault_slot": 129,
+    "fault_ticks": 1500000000,
+    "tokens": 8
+   },
+   "resources": {
+    "accum_offset": 232,
+    "group_segment_fixed_size": 44992,
+    "next_free_sgpr": 100,
+    "next_free_vgpr": 232,
+    "private_segment_fixed_size": 0
+   },
+   "sha256": "82ad2a9b8f2a9cf7abecca23dbba243d36aa884691fafe0ae99ac36f4693035e"
+  }
+ },
+ "image": "muse-mono-dev:df3bd094 (sha256:8fefa1bded29d5e9314f3aacb121c88bc9e31db63d75120163e984a67fff8b6c)",
+ "procedure": [
+  "The Phase A K2 builds' final ISA (DESIGN_BC 9.1), recorded BEFORE any Phase B / C kernel edit; test_compile.py::test_k2_tensor_isa_unchanged compares every core='tensor' build with it.",
+  "Digest: sha256 of the build's *final_isa.s (FLYDSL_DUMP_IR) with every whole-word occurrence of its kernel symbol replaced by '<kernel>' (test_compile.isa_digest).",
+  "Compile: GPU-less, COMPILE_ONLY=1 FLYDSL_RUNTIME_ENABLE_CACHE=0 FLYDSL_DUMP_IR=1 FLYDSL_GPU_ARCH=gfx950 ARCH=gfx950, layer.build(key)(*layer.ABI.zeros()) for each of test_compile.BUILDS (widths 1..8, the two fault builds, the S=8 debug build). Deterministic: two runs, same hashes.",
+  "Recorded 2026-10-20 from a clean checkout of okorzh/muse-spark-amd-mono at ca9640e2e2 (git status empty), in muse-mono-dev:df3bd094 via /home/okorzh/muse-mono/bin/cpu_bc.sh; the resources equal the Phase A STATUS compile table.",
+  "Regenerate ONLY when the toolchain changes (the test skips while 'toolchain' differs from the image's) and ONLY from the Phase A K2 sources: a tree whose vllm/models/muse_spark/amd/specialized_decode/mono/ is ca9640e2e2's (git worktree add <dir> ca9640e2e2, plus the image's compiled vllm/*.so as bin/cpu_bc.sh mounts them), with this test_compile.py copied in: python3 tests/models/muse_spark/amd_specialized_decode/test_compile.py --write-baseline <source> <image>. Never regenerate from a tree with B / C kernel edits: the test would then pass vacuously."
+ ],
+ "source": "okorzh/muse-spark-amd-mono ca9640e2e2 (clean)",
+ "toolchain": {
+  "amd-aiter": "0.1.25",
+  "flydsl": "0.3.4.1"
+ }
+}

@@ -2,10 +2,15 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Muse Spark's specialized decode on CPU: the switch, its widths and kernel
 layers, its three refusal stages (config, loaded weights, KV caches), plan()
-routing, the layer kernel's launch contract, the model hooks, the model state
-and the fail-stop vote. The kernel module (``mono.layer``) is stubbed."""
+routing, the layer kernels' launch contracts (Phase A, and the Phase B / C
+fronts and cores with their per-layer KV and metadata binding), the model
+hooks, the model state and the fail-stop vote. The kernel modules
+(``mono.layer``, ``mono.k1``) are stubbed."""
 
-from types import SimpleNamespace
+import importlib.machinery
+import importlib.util
+import sys
+from types import ModuleType, SimpleNamespace
 
 import pytest
 import torch
@@ -57,7 +62,9 @@ from vllm.models.muse_spark.amd.specialized_decode.runtime.guards import (  # no
 )
 from vllm.models.muse_spark.amd.specialized_decode.runtime.layers import (  # noqa: E402
     STEP_ARGS,
+    STEP_ARGS_BY_CORE,
     KernelLayer,
+    Phases,
 )
 from vllm.models.muse_spark.common.layers import (  # noqa: E402
     MuseSpark1xNormPreservingResidualConnection,
@@ -71,6 +78,7 @@ from vllm.v1.attention.backends.rocm_aiter_fa import (  # noqa: E402
 )
 
 from .conftest import dspark, quark_config, vllm_config  # noqa: E402
+from .reference import FakeMrv2  # noqa: E402
 
 BF, F32, U8 = torch.bfloat16, torch.float32, torch.uint8
 ALL_WIDTHS = (1, 2, 3, 4, 5, 6, 7, 8)
@@ -436,16 +444,44 @@ def _moe(backend=Mxfp4MoeBackend.AITER_MXFP4_MXFP4, quantized=True):
     return moe
 
 
-class _Attn:
-    """``MuseSpark1xAttention`` as the kernel layer sees it."""
+def _impl(kind: str):
+    """The checkpoint's ``AiterFlashAttentionImpl`` options for a ``kind``
+    layer (model.py: sliding window 2048, scale 0.125 x qk_scale_factor)."""
+    impl = AiterFlashAttentionImpl.__new__(AiterFlashAttentionImpl)
+    impl.sliding_window = (2047, 0) if kind == SLIDING else (-1, -1)
+    impl.sinks = impl.alibi_slopes = impl.kv_sharing_target_layer_name = None
+    impl.logits_soft_cap = 0.0
+    impl.num_queries_per_kv = 8
+    impl.scale = 64**-0.5 * 5.4730064863875
+    return impl
 
-    def __init__(self, i: int, kv=None):
+
+class _Attn:
+    """``MuseSpark1xAttention`` as the kernel layers see it (a ``kind``
+    layer: RoPE and the window on sliding layers)."""
+
+    def __init__(self, i: int, kv=None, kind=SLIDING):
         self.o_proj = SimpleNamespace(weight=_meta(8192, 1024))
+        self.qkv_proj = SimpleNamespace(weight=_meta(2304, 8192))
         self.num_heads, self.head_dim, self.num_kv_heads = 16, 64, 2
         self.fused_qk_norm_rope_kv_insert = True
         self.pre_qkv_proj_norm = _norm(8192, 1e-5)
+        self.qk_norm = SimpleNamespace(has_weight=False)
+        self.o_norm = SimpleNamespace(has_weight=False)
+        self.fuse_o_norm_gate, self.rms_norm_eps = True, 1e-5
+        self.use_attn_temperature_tuning = False
+        self.rotary_emb = (
+            SimpleNamespace(
+                is_neox_style=False,
+                rotary_dim=64,
+                head_size=64,
+                cos_sin_cache=torch.zeros(1024, 64),
+            )
+            if kind == SLIDING
+            else None
+        )
         self.attn = SimpleNamespace(
-            impl=AiterFlashAttentionImpl.__new__(AiterFlashAttentionImpl),
+            impl=_impl(kind),
             layer_name=f"model.layers.{i}.self_attn.attn",
             kv_cache=torch.tensor([]) if kv is None else kv,
         )
@@ -456,11 +492,23 @@ class _Attn:
         self.calls.append((positions, hidden_states))
         return torch.zeros(hidden_states.size(0), spec.CORE, dtype=BF)
 
+    def front(self, positions, hidden_states):
+        self.calls.append(("front", positions, hidden_states))
+        return torch.zeros(hidden_states.size(0), spec.QKV_ROWS, dtype=BF)
+
+    def attend(self, qkv, gate=True):
+        self.calls.append(("attend", qkv, gate))
+        return torch.zeros(qkv.size(0), spec.CORE, dtype=BF)
+
+
+def _kind(i: int) -> str:
+    return FULL if _KINDS[i] == "full_attention" else SLIDING
+
 
 def _layer(i: int, moe=None, kv=None):
     return SimpleNamespace(
         layer_idx=i,
-        self_attn=_Attn(i, kv),
+        self_attn=_Attn(i, kv, _kind(i)),
         feed_forward=_moe() if moe is None else moe,
         add_attn=_connection(),
         add_ffn=_connection(),
@@ -769,6 +817,7 @@ def _decode(monkeypatch, mode=CUDAGraphMode.NONE, md=None, q=1, is_padding=True)
     decode.names = NAMES
     decode.runner = SimpleNamespace(no_pad=torch.zeros(16, dtype=U8))
     decode.kernels = {w: {1: _Kernel(), 2: _Kernel()} for w in widths}
+    decode.reads_kv = False  # Phase A: no metadata read (_check_metadata)
     decode._kv = (1, 2)
     monkeypatch.setattr(SpecializedDecode, "_kv_key", lambda self: (1, 2))
     context = SimpleNamespace(
@@ -888,6 +937,7 @@ class _Runner:
 
     def __init__(self, calls, first_layer=1):
         self.calls, self.first_layer, self.fault = calls, first_layer, {}
+        self.fault_k1: dict = {}
         self.scratch = torch.zeros(8, dtype=U8)
         self.epoch = torch.zeros(1, dtype=torch.int32)
         self.health = torch.zeros(8, dtype=torch.int32)
@@ -902,22 +952,30 @@ class _Runner:
     peer_args = runner_mod.MonoRunner.peer_args
 
 
-def _kernel_loop(monkeypatch, width=2):
+def _kernel_loop(monkeypatch, width=2, phases=None, q=1):
+    phases = phases or Phases()
     calls: list = []
     bb = _backbone()
     runner = _Runner(calls)
     kernels = {
-        i: KernelLayer(bb.layers[i], bb.layers[i - 1], runner, width) for i in (1, 2, 3)
+        i: KernelLayer(
+            bb.layers[i], bb.layers[i - 1], runner, width, _kind(i), q, phases
+        )
+        for i in (1, 2, 3)
     }
 
     def launch(key, args):
         calls.append(("launch", key, args))
+
+    def launch_k1(key, args):
+        calls.append(("k1", key, args))
 
     def boundary(x, pre_norm, *, out_dtype):
         assert out_dtype == BF
         return torch.zeros(width, spec.HIDDEN, dtype=BF), x.stream
 
     monkeypatch.setattr(layers_mod, "k2_launch", launch)
+    monkeypatch.setattr(layers_mod, "k1_launch", launch_k1)
     monkeypatch.setattr(model_mod, "norm_residual_then_norm", boundary)
     pad = torch.zeros(16, dtype=U8)
     step = Step(width, {}, {}, kernels, pad)
@@ -1061,8 +1119,8 @@ class _Decode:
     def after_step(self):
         self.calls.append("after_step")
 
-    def prepare_kv(self):
-        self.calls.append("prepare_kv")
+    def prepare_kv(self, kv_cache_config=None, block_tables=None):
+        self.calls.append(("prepare_kv", kv_cache_config, block_tables))
 
     def after_capture(self):
         self.calls.append("after_capture")
@@ -1170,9 +1228,14 @@ def test_model_state_lifecycle(monkeypatch):
     omni = SimpleNamespace(get_language_model=lambda: lm)
     state = MuseSparkModelState("cfg", omni, None, "cpu")
     assert built == ["cfg"] and state.language_model is lm
-    state.initialize_kv_cache(None, None)
+    # MRV2's handles reach the bind (DESIGN_BC 8.3: tables pinned at bind)
+    kv_cache_config, block_tables = object(), object()
+    state.initialize_kv_cache(kv_cache_config, block_tables)
     state.capture_inner_cudagraphs(None, None, None, None)
-    assert decode.calls == ["prepare_kv", "after_capture"]
+    assert decode.calls == [
+        ("prepare_kv", kv_cache_config, block_tables),
+        "after_capture",
+    ]
 
     # mono off: built never, the hooks are no-ops
     off = _causal_lm()
@@ -1356,6 +1419,7 @@ class _ExecRunner:
         self.no_pad = torch.zeros(runner_mod.NO_PAD_BYTES, dtype=U8)
         self.peer_table = torch.zeros(8, dtype=torch.int64)
         self.rank, self.alarm, self.fault, self.first_layer = 0, 0, {}, -1
+        self.fault_k1: dict = {}
         self.steps, self.epoch_mark = 0, None
 
     step_begin = runner_mod.MonoRunner.step_begin
@@ -1365,10 +1429,12 @@ class _ExecRunner:
     peer_args = runner_mod.MonoRunner.peer_args
 
 
-def _executor(monkeypatch, fill=0.0, compile_error=None):
+def _executor(monkeypatch, fill=0.0, compile_error=None, extra=None, q=1):
     """A ``SpecializedDecode`` over a 4-layer fake backbone (kernel layers 1..3)
-    at widths 1..3, with the kernel module, the TP group and the fail-stop
-    stubbed. ``fill``: what the stub launch writes into ``branch_out``."""
+    at widths 1..3 (8 under DSpark), with the kernel modules, the TP group and
+    the fail-stop stubbed. ``fill``: what the stub launches write into
+    ``branch_out`` (and K1's ``qkvo``); ``extra``: more ``additional_config``
+    (the phases)."""
     from vllm.models.muse_spark.amd.specialized_decode.mono.abi import FAILED
 
     bb = _backbone()
@@ -1383,23 +1449,33 @@ def _executor(monkeypatch, fill=0.0, compile_error=None):
     def launch(key, args):
         tokens = key.tokens
         pad = args["pad"][:tokens]
-        launches.append((key, int(args["epoch"][0]), bool(pad.all())))
-        assert set(args) == set(spec.K2_ARGS)
+        launches.append((key, int(args["epoch"][0]), bool(pad.all()), args))
+        assert set(args) == set(spec.K2_ARGS_BY_CORE[key.core])
         args["stream_out"].zero_()
         args["branch_out"].fill_(0.0 if bool(pad.all()) else fill)
+
+    def launch_k1(key, args):
+        pad = args["pad"][: key.tokens]
+        launches.append((key, int(args["epoch"][0]), bool(pad.all()), args))
+        assert set(args) == set(spec.K1_ARGS)
+        args["stream_out"].zero_()
+        args["qkvo"].fill_(0.0 if bool(pad.all()) else fill)
 
     tp = SimpleNamespace(cpu_group=None, world_size=1, rank_in_group=0)
     monkeypatch.setattr(decode_mod, "get_tp_group", lambda: tp)
     monkeypatch.setattr(decode_mod, "MonoRunner", _ExecRunner)
     monkeypatch.setattr(decode_mod, "compile_build", compile_build)
-    monkeypatch.setattr(decode_mod, "k2_launch", launch)
+    monkeypatch.setattr(layers_mod, "k2_launch", launch)
+    monkeypatch.setattr(layers_mod, "k1_launch", launch_k1)
     monkeypatch.setattr(
         decode_mod, "FailStop", lambda failed, rank, world, group: failed
     )
     monkeypatch.setattr(torch.accelerator, "synchronize", lambda *a: None)
     monkeypatch.setattr(decode_mod.logger, "info", lambda msg, *a: logs.append(a))
     cfg = vllm_config()
-    decode = SpecializedDecode(bb, DecodeConfig(1, (1, 2, 3)), cfg)
+    cfg.additional_config.update(extra or {})
+    widths = (1, 2, 3) if q == 1 else (8,)
+    decode = SpecializedDecode(bb, DecodeConfig(q, widths), cfg)
     assert decode.failstop.data_ptr() == decode.runner.health[FAILED:].data_ptr()
     return decode, bb, compiled, launches, logs
 
@@ -1442,7 +1518,7 @@ def test_executor_lifecycle(monkeypatch):
     decode.prepare_kv()
     assert decode._kv == decode._kv_key() is not None
     assert int(runner.health[WAIT_BUDGET]) == 120
-    assert [(k.tokens, e, p) for k, e, p in launches] == [
+    assert [(k.tokens, e, p) for k, e, p, _ in launches] == [
         (1, 1, True), (1, 2, False), (2, 3, True), (2, 4, False),
         (3, 5, True), (3, 6, False),
     ]  # fmt: skip
@@ -1476,6 +1552,47 @@ def test_executor_lifecycle(monkeypatch):
         decode.prepare_kv()
 
 
+def test_self_test_reads_only_the_launch_contract(monkeypatch):
+    """``test_numerics``' TP8 self-test drives ``self_test`` with stand-ins
+    holding a KernelLayer's launch contract alone (``static``, ``builds``) on
+    an executor without ``first``: Phase A's launches, the first kernel layer
+    of each width, on a zero core and stream."""
+    decode, bb, _, launches, _ = _executor(monkeypatch)
+    runner = decode.runner
+
+    def stand_in(w, i):
+        static = dict(decode.kernels[w][i].static)
+        return SimpleNamespace(
+            static=static, builds=lambda: [spec.K2Build(tokens=w, **runner.fault)]
+        )
+
+    sd = object.__new__(SpecializedDecode)
+    sd.runner = runner
+    sd.kernels = {w: {i: stand_in(w, i) for i in (1, 2)} for w in (1, 3)}
+    sd.self_test()
+    assert [(k.tokens, e, p) for k, e, p, _ in launches] == [
+        (1, 1, True), (1, 2, False), (3, 3, True), (3, 4, False),
+    ]  # fmt: skip
+    for key, _, _, args in launches:
+        assert args["slot"] == spec.k2_slot(1)
+        assert tuple(args["core"].shape) == (key.tokens, spec.CORE)
+        assert not args["core"].any() and not args["stream"].any()
+
+
+def test_a_rank_whose_bind_raises_votes(monkeypatch):
+    """A KernelLayer bind error (a reassigned RoPE table) is a reason in the
+    KV caches' vote, so every rank stops before the self-test's launches."""
+    decode, bb, _, launches, _ = _executor(monkeypatch, extra=K1_SPLIT)
+    _bind(bb)
+    rope = bb.layers[2].self_attn.rotary_emb
+    rope.cos_sin_cache = rope.cos_sin_cache.to(BF)
+    with pytest.raises(
+        ValueError, match="the KV caches: .*layer 2's RoPE table .* was reassigned"
+    ):
+        decode.prepare_kv()
+    assert not launches and decode._kv is None
+
+
 def test_executor_self_test_rejects_bad_outputs(monkeypatch):
     decode, bb, _, _, _ = _executor(monkeypatch, fill=float("nan"))
     _bind(bb)
@@ -1487,7 +1604,7 @@ def test_executor_refuses_before_any_collective(monkeypatch):
     with pytest.raises(ValueError, match="compiling the kernels failed"):
         _executor(monkeypatch, compile_error=RuntimeError("no gfx950"))
     monkeypatch.setattr(
-        decode_mod, "refuse_model", lambda bb, layers: ["layer 2: w13 not shuffled"]
+        decode_mod, "refuse_model", lambda bb, layers, *a: ["layer 2: w13 not shuffled"]
     )
     monkeypatch.setattr(
         decode_mod,
@@ -1627,6 +1744,7 @@ def test_mono_off_model_hooks_are_inert(monkeypatch):
     attn = object.__new__(MuseSpark1xAttention)
     nn.Module.__init__(attn)
     attn.num_heads, attn.head_dim = 2, 4
+    attn.q_size, attn.kv_size = 8, 0
     attn.qkv_proj = lambda h: (h, None)
     attn._qk_norm_rope_kv_insert = lambda qkv, positions: (qkv, None, None, None)
     attn.fused_qk_norm_rope_kv_insert = True
@@ -1667,3 +1785,1172 @@ def test_importing_the_model_loads_no_kernel_module():
         [sys.executable, "-c", code], capture_output=True, text=True, timeout=300
     )
     assert r.returncode == 0, r.stderr[-4000:]
+
+
+# --------------------------------------------------------------------------
+# Phases B and C: the switch, the builds, compile dispatch, the per-layer
+# binding, the refusals they add and the metadata invariants
+
+K1_SPLIT = {"mono_front": "k1", "mono_core": "split"}
+
+
+def test_phases_default_to_phase_a_and_are_validated():
+    cfg = vllm_config()
+    assert layers_mod.decode_phases(cfg) == Phases("stock", "tensor")
+    cfg.additional_config = None
+    assert layers_mod.decode_phases(cfg) == Phases()
+    cfg.additional_config = {"mono_front": "k1", "mono_core": "gated"}
+    assert layers_mod.decode_phases(cfg) == Phases("k1", "gated")
+    for bad in (
+        {"mono_front": "K1"},
+        {"mono_core": "fused"},
+        # the narrowest K1 width: an int in 1..8, only with K1 on
+        {"mono_front": "k1", "mono_k1_min_width": 0},
+        {"mono_front": "k1", "mono_k1_min_width": 9},
+        {"mono_front": "k1", "mono_k1_min_width": "6"},
+        {"mono_front": "k1", "mono_k1_min_width": True},
+        {"mono_k1_min_width": 6},
+    ):
+        cfg.additional_config = bad
+        with pytest.raises(ValueError, match="decode_backend=auto"):
+            layers_mod.decode_phases(cfg)
+    cfg.additional_config = {"mono_front": "k1", "mono_k1_min_width": 6}
+    assert layers_mod.decode_phases(cfg) == Phases("k1", "tensor", 6)
+    assert [Phases("k1", k1_min_width=6).front_at(w) for w in (1, 5, 6, 8)] == [
+        "stock",
+        "stock",
+        "k1",
+        "k1",
+    ]
+    assert Phases().front_at(8) == "stock" and Phases("k1").front_at(1) == "k1"
+    # the split core serves q = 1 only; DSpark verify keeps the gated core load
+    split = Phases(core="split")
+    assert split.k2_core(1) == "split" and split.k2_core(8) == "gated"
+    assert split.reads_kv(1) and not split.reads_kv(8)
+    assert Phases(front="k1").reads_kv(8)
+    assert not Phases(core="gated").reads_kv(1) and not Phases().reads_kv(1)
+
+
+@pytest.mark.parametrize("q", [1, 8])
+@pytest.mark.parametrize(
+    "front, core", [(f, c) for f in ("stock", "k1") for c in spec.K2_CORES]
+)
+def test_builds_per_width_kind_and_q(front, core, q):
+    """K1Build(w, rope=sliding) with K1 on; K2Build(w, core, window=sliding) for
+    the split core at q = 1, the gated core at q = 8 (DESIGN_BC 3.2)."""
+    bb = _backbone()
+    runner = _Runner([])
+    phases = Phases(front, core)
+    for w in (1, 5, 8) if q == 1 else (8,):
+        for i in (1, 2):
+            kind = _kind(i)
+            k = KernelLayer(bb.layers[i], bb.layers[i - 1], runner, w, kind, q, phases)
+            want_core = "gated" if core == "split" and q == 8 else core
+            k2 = spec.K2Build(
+                tokens=w,
+                core=want_core,
+                window=want_core == "split" and kind == SLIDING,
+            )
+            assert k.key() == k2 and k.core == want_core
+            if front == "k1":
+                k1 = spec.K1Build(tokens=w, rope=kind == SLIDING)
+                assert k.k1_key() == k1 and k.builds() == [k1, k2]
+            else:
+                assert k.k1_key() is None and k.builds() == [k2]
+    with pytest.raises(ValueError, match="attention kind"):
+        KernelLayer(bb.layers[1], bb.layers[0], runner, 1, "global")
+
+
+@pytest.mark.parametrize("core", spec.K2_CORES)
+def test_k1_serves_only_from_its_min_width(monkeypatch, core):
+    """DESIGN_BC 11.3 (K1 fails its gate at S = 1, passes at S = 8): with
+    ``mono_k1_min_width`` 6, widths 1..5 keep vLLM's front (no K1 build, the
+    front through ``A.front`` or the stock layer) and K2's core is unchanged."""
+    bb = _backbone()
+    runner = _Runner([])
+    phases = Phases("k1", core, 6)
+    for w in range(1, spec.MAX_ROWS + 1):
+        for i in (1, 2):
+            kind = _kind(i)
+            k = KernelLayer(bb.layers[i], bb.layers[i - 1], runner, w, kind, 1, phases)
+            k2 = spec.K2Build(
+                tokens=w, core=core, window=core == "split" and kind == SLIDING
+            )
+            if w < 6:
+                assert k.k1_key() is None and k.static_k1 is None
+                assert k.builds() == [k2]
+            else:
+                k1 = spec.K1Build(tokens=w, rope=kind == SLIDING)
+                assert k.builds() == [k1, k2]
+    if core == "split":
+        return  # its stock-front binding: test_split_binding_on_the_stock_front
+    # a narrow step runs vLLM's boundary and front, then K2 on the same core
+    bb, runner, step, calls = _kernel_loop(monkeypatch, width=2, phases=phases)
+    step.layer(2)(torch.zeros(2, dtype=torch.int64), _stream(bb.layers[1]))
+    launches = [c for c in calls if c != "step_begin"]
+    assert [(c[0], c[1]) for c in launches] == [
+        ("launch", spec.K2Build(tokens=2, core=core))
+    ]
+
+
+def test_fault_builds_follow_the_runner_per_kernel(monkeypatch):
+    bb, runner, step, calls = _kernel_loop(monkeypatch, phases=Phases("k1", "gated"))
+    runner.fault = {
+        "fault_rank": 3,
+        "fault_epoch": 2,
+        "fault_slot": 129,
+        "fault_ticks": 5,
+    }
+    runner.fault_k1 = {
+        "fault_rank": 1,
+        "fault_epoch": 9,
+        "fault_slot": 1,
+        "fault_ticks": 7,
+    }
+    k1, k2 = step.kernels[1].builds()
+    assert k1 == spec.K1Build(tokens=2, rope=False, **runner.fault_k1)
+    assert k2 == spec.K2Build(tokens=2, core="gated", **runner.fault)
+
+
+def _module(name: str, **attrs) -> ModuleType:
+    mod = ModuleType(name)
+    mod.__spec__ = importlib.machinery.ModuleSpec(name, None)
+    for k, v in attrs.items():
+        setattr(mod, k, v)
+    return mod
+
+
+def _fake_kernels(monkeypatch, abi_by_core=None, k1=True):
+    """Stub ``mono.layer`` (``ABI_BY_CORE`` when given, else Phase A's single
+    ABI) and ``mono.k1`` (absent unless ``k1``); returns the builds' calls."""
+    from vllm.models.muse_spark.amd.specialized_decode import mono
+    from vllm.models.muse_spark.amd.specialized_decode.mono.common.plan import (
+        KernelAbi,
+    )
+
+    calls: list = []
+
+    def build_of(module):
+        def build(key):
+            def launch(*args, stream=None):
+                import os
+
+                calls.append((module, key, args, os.environ.get("COMPILE_ONLY")))
+
+            return launch
+
+        return build
+
+    pkg = "vllm.models.muse_spark.amd.specialized_decode.mono"
+    layer = _module(pkg + ".layer", ABI=KernelAbi(("a", "b")), build=build_of("k2"))
+    if abi_by_core is not None:
+        abis = {c: KernelAbi(n) for c, n in abi_by_core.items()}
+        setattr(layer, "ABI_BY_CORE", abis)  # noqa: B010
+    monkeypatch.setitem(sys.modules, pkg + ".layer", layer)
+    monkeypatch.setattr(mono, "layer", layer, raising=False)
+    if k1:
+        k1_mod = _module(pkg + ".k1", ABI=KernelAbi(("x",)), build=build_of("k1"))
+        monkeypatch.setitem(sys.modules, pkg + ".k1", k1_mod)
+        monkeypatch.setattr(mono, "k1", k1_mod, raising=False)
+    else:
+        real = importlib.util.find_spec
+        monkeypatch.setattr(
+            importlib.util,
+            "find_spec",
+            lambda name, *a: None if name == pkg + ".k1" else real(name, *a),
+        )
+        monkeypatch.delitem(sys.modules, pkg + ".k1", raising=False)
+        monkeypatch.delattr(mono, "k1", raising=False)
+    return calls
+
+
+def test_compile_build_dispatches_on_the_key(monkeypatch):
+    """K1Build -> mono.k1 with k1.ABI; K2Build -> mono.layer with
+    ABI_BY_CORE[core]; compile-only, the switch restored afterwards."""
+    monkeypatch.delenv("COMPILE_ONLY", raising=False)
+    calls = _fake_kernels(monkeypatch, {"tensor": ("a", "b"), "gated": ("a", "b", "c")})
+    layers_mod.compile_build(spec.K2Build(tokens=2))
+    layers_mod.compile_build(spec.K2Build(tokens=2, core="gated"))
+    layers_mod.compile_build(spec.K1Build(tokens=3, rope=True))
+    assert [(m, k, a, env) for m, k, a, env in calls] == [
+        ("k2", spec.K2Build(tokens=2), (0, 0), "1"),
+        ("k2", spec.K2Build(tokens=2, core="gated"), (0, 0, 0), "1"),
+        ("k1", spec.K1Build(tokens=3, rope=True), (0,), "1"),
+    ]
+    import os
+
+    assert "COMPILE_ONLY" not in os.environ
+    # a core mono.layer does not build: refused at startup, never compiled
+    with pytest.raises(RuntimeError, match="'split' core is not in this build"):
+        layers_mod.compile_build(spec.K2Build(tokens=2, core="split", window=True))
+    with pytest.raises(TypeError, match="K1Build or a K2Build"):
+        layers_mod.compile_build((2, "tensor"))
+    assert len(calls) == 3
+
+
+def test_compile_build_refuses_kernels_this_tree_lacks(monkeypatch):
+    """Phase A's mono.layer (no ABI_BY_CORE) builds the tensor core only, and a
+    tree without mono.k1 refuses K1 keys."""
+    calls = _fake_kernels(monkeypatch, None, k1=False)
+    layers_mod.compile_build(spec.K2Build(tokens=1))
+    with pytest.raises(RuntimeError, match="'gated' core is not in this build"):
+        layers_mod.compile_build(spec.K2Build(tokens=1, core="gated"))
+    with pytest.raises(RuntimeError, match="K1 .* is not in this build"):
+        layers_mod.compile_build(spec.K1Build(tokens=1, rope=False))
+    assert [c[1] for c in calls] == [spec.K2Build(tokens=1)]
+
+
+def test_kernel_module_matches_the_real_tree():
+    """On this tree: every core mono.layer declares maps to its ABI, the others
+    are refused (no build under another build's ABI); a K1 key maps to
+    mono.k1 when the tree has it."""
+    pytest.importorskip("flydsl")
+    from vllm.models.muse_spark.amd.specialized_decode.mono import layer
+
+    abis = getattr(layer, "ABI_BY_CORE", {"tensor": layer.ABI})
+    assert abis["tensor"].names == layer.ABI.names
+    for core in spec.K2_CORES:
+        key = spec.K2Build(tokens=1, core=core, window=core == "split")
+        if core in abis:
+            assert layers_mod._kernel_module(key) == (layer, abis[core])
+        else:
+            with pytest.raises(RuntimeError, match="not in this build"):
+                layers_mod._kernel_module(key)
+    k1_key = spec.K1Build(tokens=1, rope=True)
+    if importlib.util.find_spec(f"{layers_mod._MONO}.k1") is None:
+        with pytest.raises(RuntimeError, match="not in this build"):
+            layers_mod._kernel_module(k1_key)
+    else:
+        from vllm.models.muse_spark.amd.specialized_decode.mono import k1
+
+        assert layers_mod._kernel_module(k1_key) == (k1, k1.ABI)
+
+
+def _bind_fake(bb, layers=(1, 2, 3)):
+    """Distinct zero caches a kernel layer, [blocks, 2, 16, 128] bf16."""
+    for i in layers:
+        bb.layers[i].self_attn.attn.kv_cache = torch.zeros(2 + i, 2, 16, 128, dtype=BF)
+
+
+def _mrv2(bb):
+    """MRV2's persistent buffers with two KV groups: layer 1 full, layers 2
+    and 3 sliding (one group)."""
+    name = lambda i: bb.layers[i].self_attn.attn.layer_name  # noqa: E731
+    return FakeMrv2({"full": [name(1)], "sw": [name(2), name(3)]}, {"sw"})
+
+
+def _mrv2_step(mrv2, width=2):
+    pages = {"full": [[3, 4, 5], [6]], "sw": [[7, 8, 9], [10]]}
+    return mrv2.step([40, 9], pages, width)
+
+
+def test_per_layer_binding_k1_and_split(monkeypatch):
+    """Each layer's K1 and K2(split) launches carry its own KV cache and its
+    KV group's slot mapping / block table, the step's positions, seq_lens and
+    pad; K1's static arguments are views of the module's tensors; no stock
+    attention runs (DESIGN_BC 3.3, 8.4)."""
+    bb, runner, step, calls = _kernel_loop(monkeypatch, phases=Phases("k1", "split"))
+    _bind_fake(bb)
+    for k in step.kernels.values():
+        k.bind_kv()
+    mrv2 = _mrv2(bb)
+    view = _mrv2_step(mrv2)
+    step = Step(2, view.attn_metadata, view.slot_mapping, step.kernels, view.pad)
+    x = _stream(bb.layers[0])
+    for i in (1, 2, 3):
+        x = step.layer(i)(view.positions, x)
+    kinds = [c if isinstance(c, str) else c[0] for c in calls]
+    assert kinds == ["step_begin", "k1", "launch", "k1", "launch", "k1", "launch"]
+    launches = [c for c in calls if c != "step_begin"]
+    for n, i in enumerate((1, 2, 3)):
+        layer, prev = bb.layers[i], bb.layers[i - 1]
+        A, kv = layer.self_attn, layer.self_attn.attn.kv_cache
+        (_, k1, a1), (_, k2, a2) = launches[2 * n : 2 * n + 2]
+        g = 0 if i == 1 else 1
+        assert k1 == spec.K1Build(tokens=2, rope=i != 1)
+        assert k2 == spec.K2Build(tokens=2, core="split", window=i != 1)
+        assert set(a1) == set(spec.K1_ARGS)
+        assert set(a2) == set(spec.K2_ARGS_BY_CORE["split"])
+        # K1: this layer's slots, cache and weights; the previous boundary
+        assert a1["slots"].data_ptr() == mrv2.slot_mappings[g].data_ptr()
+        assert a1["positions"] is view.positions and a1["pad"] is view.pad
+        assert a1["kv"] is kv and a2["kv"] is kv
+        assert a1["kv_sb"] == kv.stride(0) * 2 and a1["kv_sh"] == kv.stride(1) * 2
+        assert a1["kv_st"] == kv.stride(2) * 2 and a1["kv_blocks"] == 2 + i
+        assert a1["w_qkv"] is A.qkv_proj.weight
+        assert a1["w_preqkv"] is A.pre_qkv_proj_norm.weight
+        assert a1["w_postffn"] is prev.post_ffn_norm.weight
+        assert a1["ffn_alpha"] is prev.add_ffn.alpha
+        assert a1["ffn_beta"] is prev.add_ffn.beta
+        if i == 1:  # NoPE
+            assert a1["cos_sin"] == 0 and a1["max_pos"] == 0
+        else:
+            assert a1["cos_sin"] is A.rotary_emb.cos_sin_cache
+            assert a1["max_pos"] == 1024
+        assert a1["slot"] == spec.k1_slot(i) and a2["slot"] == spec.k2_slot(i)
+        assert a1["rank"] == 3 and "peers" not in a1
+        # K2 reads K1's rows and stream, its group's table and seq_lens
+        assert a2["qkvo"] is a1["qkvo"] and a2["stream"] is a1["stream_out"]
+        assert (
+            a2["block_table"].data_ptr()
+            == mrv2.block_tables["full" if i == 1 else "sw"].data_ptr()
+        )
+        assert a2["bt_stride"] == 256 and a2["bt_rows"] == spec.MAX_ROWS
+        assert a2["seq_lens"].data_ptr() == mrv2.seq_lens.data_ptr()
+        assert a2["pad"] is view.pad
+        assert not A.calls  # no stock front or attention
+    # K1's input is the previous layer's deferred boundary, as is
+    assert launches[0][2]["branch"] is not None
+
+
+@pytest.mark.parametrize("core", ["tensor", "gated"])
+def test_k1_feeds_the_stock_core(monkeypatch, core):
+    """K1 + the stock core: vLLM's attention reads K1's qkv rows (attend),
+    gated (tensor core) or not (gated core); K2 reads K1's stream."""
+    bb, runner, step, calls = _kernel_loop(monkeypatch, phases=Phases("k1", core))
+    _bind_fake(bb)
+    for k in step.kernels.values():
+        k.bind_kv()
+    mrv2 = _mrv2(bb)
+    view = _mrv2_step(mrv2)
+    step = Step(2, view.attn_metadata, view.slot_mapping, step.kernels, view.pad)
+    step.layer(2)(view.positions, _stream(bb.layers[1]))
+    (_, _, a1), (_, k2, a2) = [c for c in calls if c != "step_begin"]
+    A = bb.layers[2].self_attn
+    assert A.calls == [("attend", a1["qkvo"], core == "tensor")]
+    assert k2 == spec.K2Build(tokens=2, core=core)
+    assert set(a2) == set(spec.K2_ARGS_BY_CORE[core])
+    assert a2["stream"] is a1["stream_out"]
+    if core == "gated":
+        assert a2["qkvo"] is a1["qkvo"]
+
+
+def test_gated_core_on_the_stock_front(monkeypatch):
+    """B2: vLLM's boundary and front (A.front), the raw attention output
+    (attend(gate=False)) and the qkv rows into K2(gated); no K1."""
+    bb, runner, step, calls = _kernel_loop(monkeypatch, phases=Phases(core="gated"))
+    positions = torch.zeros(2, dtype=torch.int64)
+    step.layer(2)(positions, _stream(bb.layers[1]))
+    A = bb.layers[2].self_attn
+    (_, key, args) = calls[-1]
+    assert [c[0] for c in A.calls] == ["front", "attend"]
+    assert A.calls[0][1] is positions and A.calls[1] == ("attend", args["qkvo"], False)
+    assert key == spec.K2Build(tokens=2, core="gated")
+    assert set(args) == set(spec.K2_ARGS_BY_CORE["gated"])
+    assert args["qkvo"].shape == (2, spec.QKV_ROWS)
+    assert args["attn"].shape == (2, spec.CORE)
+    k = step.kernels[2]
+    assert set(k.static) | set(STEP_ARGS_BY_CORE["gated"]) == set(
+        spec.K2_ARGS_BY_CORE["gated"]
+    )
+    assert not set(k.static) & set(STEP_ARGS_BY_CORE["gated"])
+    # the split core on the stock front: A.front's rows, no attention
+    bb, runner, step, calls = _kernel_loop(monkeypatch, phases=Phases(core="split"))
+    _bind_fake(bb)
+    for k in step.kernels.values():
+        k.bind_kv()
+    view = _mrv2_step(_mrv2(bb))
+    step = Step(2, view.attn_metadata, view.slot_mapping, step.kernels, view.pad)
+    step.layer(3)(view.positions, _stream(bb.layers[2]))
+    A = bb.layers[3].self_attn
+    assert [c[0] for c in A.calls] == ["front"]
+    (_, key, args) = calls[-1]
+    assert key == spec.K2Build(tokens=2, core="split", window=True)
+    assert args["qkvo"].shape == (2, spec.QKV_ROWS)
+
+
+def test_step_begin_precedes_k1(monkeypatch):
+    """#17: the step's first kernel layer bumps the epoch before its K1."""
+    bb, runner, step, calls = _kernel_loop(monkeypatch, phases=Phases("k1", "gated"))
+    _bind_fake(bb)
+    for k in step.kernels.values():
+        k.bind_kv()
+    view = _mrv2_step(_mrv2(bb))
+    step = Step(2, view.attn_metadata, view.slot_mapping, step.kernels, view.pad)
+    for _ in range(2):
+        x = _stream(bb.layers[0])
+        for i in (1, 2, 3):
+            x = step.layer(i)(view.positions, x)
+    kinds = [c if isinstance(c, str) else c[0] for c in calls]
+    assert (
+        kinds
+        == ["step_begin"]
+        + ["k1", "launch"] * 3
+        + ["step_begin"]
+        + [
+            "k1",
+            "launch",
+        ]
+        * 3
+    )
+
+
+def test_a_plain_stream_raises_with_k1(monkeypatch):
+    """The no-deferred-boundary path (layer 0's input) has no K1 form."""
+    bb, runner, step, calls = _kernel_loop(monkeypatch, phases=Phases("k1"))
+    with pytest.raises(RuntimeError, match="plain stream; K1 takes"):
+        step.layer(1)(torch.zeros(2), torch.zeros(2, spec.HIDDEN))
+    assert not [c for c in calls if c != "step_begin"]
+    # with K1 off the Phase A path stays
+    bb, runner, step, calls = _kernel_loop(monkeypatch, phases=Phases(core="gated"))
+    bb.layers[1].self_attn.pre_qkv_proj_norm = lambda x, out_dtype: torch.zeros(
+        2, spec.HIDDEN, dtype=out_dtype
+    )
+    step.layer(1)(torch.zeros(2), torch.zeros(2, spec.HIDDEN))
+    assert calls[-1][1] == spec.K2Build(tokens=2, core="gated")
+
+
+def test_a_reassigned_rope_table_raises_at_bind():
+    bb = _backbone()
+    runner = _Runner([])
+    k = KernelLayer(bb.layers[2], bb.layers[1], runner, 1, SLIDING, 1, Phases("k1"))
+    _bind_fake(bb)
+    k.bind_kv()  # unchanged: fine
+    rope = bb.layers[2].self_attn.rotary_emb
+    rope.cos_sin_cache = rope.cos_sin_cache.to(BF)  # what a non-fused forward does
+    with pytest.raises(RuntimeError, match="cos_sin_cache\\) was reassigned"):
+        k.bind_kv()
+    rope.cos_sin_cache = torch.zeros(1024, 64)  # another buffer, same shape
+    with pytest.raises(RuntimeError, match="was reassigned"):
+        k.bind_kv()
+    # Phase A and the gated core hold no table and bind nothing
+    k = KernelLayer(bb.layers[2], bb.layers[1], runner, 1, SLIDING, 1, Phases())
+    k.bind_kv()
+    assert k.kv_args is None and k.static_k1 is None
+
+
+def _break_bc(bb, what):
+    L, P = bb.layers[2], bb.layers[1]
+    A = L.self_attn
+    if what == "qkv shape":
+        A.qkv_proj.weight = _meta(2304, 4096)
+    elif what == "qkv quantized":
+        A.qkv_proj.weight_scale = _meta(2304, dtype=F32)
+    elif what == "pre_qkv eps":
+        A.pre_qkv_proj_norm.variance_epsilon = 1e-6
+    elif what == "prev post_ffn eps":
+        P.post_ffn_norm.variance_epsilon = 1e-6
+    elif what == "prev add_ffn dtype":
+        P.add_ffn.alpha = torch.zeros(spec.HIDDEN, dtype=BF)
+    elif what == "qk_norm weight":
+        A.qk_norm.has_weight = True
+    elif what == "temperature":
+        A.use_attn_temperature_tuning = True
+    elif what == "window":
+        A.attn.impl.sliding_window = (4095, 0)
+    elif what == "neox":
+        A.rotary_emb.is_neox_style = True
+    elif what == "short table":
+        A.rotary_emb.cos_sin_cache = torch.zeros(512, 64)
+    elif what == "full rope":
+        bb.layers[1].self_attn.rotary_emb = bb.layers[3].self_attn.rotary_emb
+    elif what == "sinks":
+        A.attn.impl.sinks = torch.zeros(16)
+    elif what == "scale":
+        A.attn.impl.scale = 0.125
+    elif what == "gqa":
+        A.attn.impl.num_queries_per_kv = 16
+    else:
+        raise AssertionError(what)
+
+
+_BC_REFUSALS = [
+    # what, the phases it needs, reason
+    ("qkv shape", ("k1", "tensor"), "layer 2 qkv_proj: (2304, 4096)"),
+    ("qkv quantized", ("k1", "tensor"), "layer 2: qkv_proj quantized"),
+    (
+        "pre_qkv eps",
+        ("k1", "tensor"),
+        "layer 2: pre_qkv_proj_norm (gain 1, eps 1e-5, weight after)",
+    ),
+    (
+        "prev post_ffn eps",
+        ("k1", "tensor"),
+        "layer 2: previous post_ffn_norm (gain 1, eps 1e-8, weight first)",
+    ),
+    (
+        "prev add_ffn dtype",
+        ("k1", "tensor"),
+        "layer 2: previous add_ffn coefficients not materialized",
+    ),
+    ("qk_norm weight", ("stock", "gated"), "layer 2: QK / output norm"),
+    ("temperature", ("k1", "tensor"), "layer 2: QK / output norm"),
+    ("window", ("stock", "split"), "layer 2: sliding attention (window / RoPE)"),
+    ("neox", ("k1", "tensor"), "layer 2: sliding attention (window / RoPE)"),
+    ("short table", ("k1", "tensor"), "layer 2: sliding attention (window / RoPE)"),
+    ("full rope", ("stock", "split"), "layer 1: full attention (window / RoPE)"),
+    ("sinks", ("stock", "split"), "layer 2: attention impl options"),
+    ("scale", ("k1", "tensor"), "layer 2: attention impl options"),
+    ("gqa", ("stock", "split"), "layer 2: attention impl options"),
+]
+
+
+@pytest.mark.parametrize("what, phases, reason", _BC_REFUSALS)
+def test_phase_bc_refusals_name_exactly_their_reason(what, phases, reason):
+    """DESIGN_BC 8.2: each row gives exactly its reason under the phases that
+    read it, and none with Phase A (the default) -- Phase A serves what it
+    served."""
+    bb = _backbone()
+    layers = kernel_layers(bb)
+    for front, core in (("k1", "split"), ("k1", "gated"), ("stock", "gated")):
+        assert refuse_model(bb, layers, front, core, 1024) == [], (front, core)
+    _break_bc(bb, what)
+    reasons = refuse_model(bb, layers, *phases, 1024)
+    assert len(reasons) == 1 and reasons[0].startswith(reason), reasons
+    reasons = refuse_model(bb, layers, "k1", "split", 1024)
+    assert len(reasons) == 1 and reasons[0].startswith(reason), reasons
+    assert refuse_model(bb, layers) == []
+
+
+def test_k1_refusals_need_the_previous_boundary():
+    """K1 runs the previous layer's FFN boundary: missing coefficients are
+    both Phase A's reason and K1's."""
+    bb = _backbone()
+    layers = kernel_layers(bb)
+    bb.layers[1].add_ffn = _connection(ready=False)
+    assert refuse_model(bb, layers) == [
+        "layer 1: add_ffn coefficients not materialized"
+    ]
+    assert refuse_model(bb, layers, "k1", "tensor") == [
+        "layer 1: add_ffn coefficients not materialized",
+        "layer 2: previous add_ffn coefficients not materialized",
+    ]
+
+
+def _cache_cfg(block=16, mode=CUDAGraphMode.FULL_AND_PIECEWISE):
+    return SimpleNamespace(
+        compilation_config=SimpleNamespace(cudagraph_mode=mode),
+        cache_config=SimpleNamespace(block_size=block),
+    )
+
+
+@pytest.mark.parametrize(
+    "kv, block, reason",
+    [
+        (None, 32, "layer 2: KV manager block 32 != kernel block 16"),
+        (
+            _meta(4, 2, 16, 132)[..., :128],
+            16,
+            "layer 2: KV rows not 16-byte aligned / not contiguous in the head dim",
+        ),
+        (
+            _meta(1, 2, 16, 2**26)[..., :128],
+            16,
+            "layer 2: KV page exceeds the 32-bit window",
+        ),
+    ],
+)
+def test_refuse_caches_phase_bc(kv, block, reason):
+    """DESIGN_BC 8.3: only kernels that read the cache (K1, the split core)
+    refuse these."""
+    bb = _backbone()
+    layers = kernel_layers(bb)
+    for i in layers:
+        bb.layers[i].self_attn.attn.kv_cache = _kv()
+    assert refuse_caches(bb, layers, _cache_cfg(), reads_kv=True) == []
+    if kv is not None:
+        bb.layers[2].self_attn.attn.kv_cache = kv
+    reasons = refuse_caches(bb, layers, _cache_cfg(block), reads_kv=True)
+    if block != 16:
+        assert len(reasons) == 3 and all(" != kernel block 16" in r for r in reasons)
+    else:
+        assert len(reasons) == 1, reasons
+    assert reasons[-1 if block == 16 else 1].startswith(reason), reasons
+    assert refuse_caches(bb, layers, _cache_cfg(block)) == []
+
+
+def _meta_decode(monkeypatch, phases=None, q=1):
+    """An executor over the fake backbone with MRV2's persistent buffers
+    (FakeMrv2: groups full / sw) under a FULL capture's forward context."""
+    phases = phases or Phases("k1", "split")
+    bb = _backbone()
+    mrv2 = _mrv2(bb)
+    decode = object.__new__(SpecializedDecode)
+    decode.backbone, decode.layers = bb, kernel_layers(bb)
+    decode.config = DecodeConfig(q=q, widths=(2, 8))
+    decode.vllm_config = vllm_config()
+    decode.vllm_config.scheduler_config.max_num_seqs = 8
+    decode.names = {
+        FULL: bb.layers[1].self_attn.attn.layer_name,
+        SLIDING: bb.layers[2].self_attn.attn.layer_name,
+    }
+    decode.runner = SimpleNamespace(no_pad=torch.zeros(16, dtype=U8))
+    decode.kernels = {w: {1: _Kernel()} for w in (2, 8)}
+    decode.reads_kv = phases.reads_kv(q)
+    decode._kv, decode._tables, decode._step_ptrs = (1, 2), {}, None
+    monkeypatch.setattr(SpecializedDecode, "_kv_key", lambda self: (1, 2))
+    ctx = SimpleNamespace(cudagraph_runtime_mode=CUDAGraphMode.FULL)
+    monkeypatch.setattr(decode_mod, "is_forward_context_available", lambda: True)
+    monkeypatch.setattr(decode_mod, "get_forward_context", lambda: ctx)
+
+    def plan(view):
+        md = dict(view.attn_metadata)
+        for m in md.values():
+            m.num_decode_tokens, m.num_decodes = view.width, view.width // q
+        ctx.attn_metadata, ctx.slot_mapping = md, view.slot_mapping
+        ctx.is_padding = view.pad
+        return decode.plan(view.positions, None)
+
+    return decode, bb, mrv2, plan
+
+
+def test_plan_checks_the_metadata_pointers(monkeypatch):
+    """Every plan() passes the persistent buffers the first one did (the
+    capture of each width, then eager steps); a moved table, slot mapping,
+    seq_lens, positions or pad mask raises (DESIGN_BC 8.3)."""
+    decode, bb, mrv2, plan = _meta_decode(monkeypatch)
+    pages = {"full": [[3, 4, 5], [6]], "sw": [[7, 8, 9], [10]]}
+    assert plan(mrv2.capture(8)) is not None  # the width-8 capture records
+    assert plan(mrv2.capture(2)) is not None
+    for _ in range(3):
+        assert plan(mrv2.step([40, 9], pages, 2)) is not None
+    names = [bb.layers[i].self_attn.attn.layer_name for i in (1, 2, 3)]
+    assert sorted(decode._tables) == sorted(names)
+    view = mrv2.step([40, 9], pages, 2)
+    moved = {
+        "table": lambda v: setattr(
+            v.attn_metadata[names[2]],
+            "block_table",
+            v.attn_metadata[names[2]].block_table.clone(),
+        ),
+        "slots": lambda v: v.slot_mapping.__setitem__(
+            names[0], v.slot_mapping[names[0]].clone()
+        ),
+        "seq_lens": lambda v: setattr(
+            v.attn_metadata[names[1]],
+            "seq_lens",
+            v.attn_metadata[names[1]].seq_lens.clone(),
+        ),
+        "positions": lambda v: setattr(v, "positions", v.positions.clone()),
+        "pad": lambda v: setattr(v, "pad", v.pad.clone()),
+    }
+    for what, move in moved.items():
+        view = mrv2.step([40, 9], pages, 2)
+        view.slot_mapping = dict(view.slot_mapping)
+        move(view)
+        with pytest.raises(RuntimeError, match="moved off MRV2's persistent"):
+            plan(view)
+    # a stride change (another table shape) too
+    view = mrv2.step([40, 9], pages, 2)
+    md = view.attn_metadata[names[0]]
+    md.block_table = torch.zeros(8, 128, dtype=torch.int32)
+    with pytest.raises(RuntimeError, match="moved off"):
+        plan(view)
+
+
+def test_plan_checks_nothing_for_phase_a_and_the_gated_core(monkeypatch):
+    for phases, q in (
+        (Phases(), 1),
+        (Phases(core="gated"), 1),
+        (Phases(core="split"), 8),
+    ):
+        decode, bb, mrv2, plan = _meta_decode(monkeypatch, phases, q)
+        view = mrv2.capture(8, q)
+        view.positions = view.positions.clone()
+        assert plan(view) is not None and decode._tables == {}
+        assert plan(mrv2.capture(8, q)) is not None
+
+
+def test_metadata_invariants_dtypes_and_size(monkeypatch):
+    decode, bb, mrv2, plan = _meta_decode(monkeypatch)
+    view = mrv2.capture(2)
+    name = bb.layers[1].self_attn.attn.layer_name
+    view.attn_metadata[name].block_table = torch.zeros(2, 4, dtype=torch.int64)
+    with pytest.raises(RuntimeError, match="block table torch.int64"):
+        plan(view)
+    decode, bb, mrv2, plan = _meta_decode(monkeypatch)
+    view = mrv2.capture(2)
+    # a table holding fewer rows than max_num_seqs
+    view.attn_metadata[name].block_table = torch.zeros(4, 16, dtype=torch.int32)
+    with pytest.raises(RuntimeError, match=">= 8 of them"):
+        plan(view)
+    decode, bb, mrv2, plan = _meta_decode(monkeypatch)
+    view = mrv2.capture(2)
+    view.slot_mapping = {**view.slot_mapping, name: view.slot_mapping[name].int()}
+    with pytest.raises(RuntimeError, match="slot mapping torch.int32"):
+        plan(view)
+    decode, bb, mrv2, plan = _meta_decode(monkeypatch)
+    view = mrv2.capture(2)
+    view.positions = view.positions.int()
+    with pytest.raises(RuntimeError, match="positions torch.int32"):
+        plan(view)
+
+
+def test_bind_pins_the_tables_to_mrv2s_buffers(monkeypatch):
+    """Given MRV2's BlockTables at the bind, a step must pass each group's
+    persistent table and slot row from its first plan on."""
+    decode, bb, mrv2, plan = _meta_decode(monkeypatch)
+    names = {g: list(n) for g, n in mrv2.groups.items()}
+    kv_cfg = SimpleNamespace(
+        kv_cache_groups=[SimpleNamespace(layer_names=names[g]) for g in mrv2.groups]
+    )
+    handles = SimpleNamespace(
+        input_block_tables=list(mrv2.block_tables.values()),
+        slot_mappings=mrv2.slot_mappings,
+    )
+    decode._bind_tables(kv_cfg, handles)
+    assert len(decode._tables) == 3 and decode._step_ptrs is None
+    assert plan(mrv2.capture(2)) is not None
+    # the groups swapped: every table is persistent, but not this layer's group
+    swapped = SimpleNamespace(
+        input_block_tables=handles.input_block_tables[::-1],
+        slot_mappings=mrv2.slot_mappings.flip(0),
+    )
+    decode._bind_tables(kv_cfg, swapped)
+    with pytest.raises(RuntimeError, match="moved off MRV2's persistent"):
+        plan(mrv2.capture(2))
+    # a kernel layer in no group
+    kv_cfg.kv_cache_groups.pop()
+    with pytest.raises(RuntimeError, match="is in no KV cache group"):
+        decode._bind_tables(kv_cfg, handles)
+
+
+def test_executor_k1_split_lifecycle(monkeypatch):
+    """K1 + the split core: K1 builds compile before K2's, every layer binds
+    its cache, and the self-test runs each kind's first layer ([K1], K2) on a
+    test-local zero cache with slots -1, positions 0, a zero [w, 1] block table
+    and seq_lens 1 (live) / 0 (pad) -- never the real cache."""
+    decode, bb, compiled, launches, logs = _executor(monkeypatch, extra=K1_SPLIT)
+    assert compiled == [
+        b
+        for w in (1, 2, 3)
+        for b in (
+            spec.K1Build(tokens=w, rope=False),
+            spec.K1Build(tokens=w, rope=True),
+            spec.K2Build(tokens=w, core="split"),
+            spec.K2Build(tokens=w, core="split", window=True),
+        )
+    ]
+    assert logs[-1][-3:] == ("k1", 1, "split")
+    _bind(bb)
+    decode.prepare_kv()
+    for by in decode.kernels.values():
+        for i, k in by.items():
+            assert k.kv_args["kv"] is bb.layers[i].self_attn.attn.kv_cache
+    # per width, per step (all pad, live): layer 1's K1, K2, layer 2's K1, K2
+    assert [(k.tokens, type(k).__name__, e, p) for k, e, p, _ in launches] == [
+        (w, kind, 2 * n + 1 + live, not live)
+        for n, w in enumerate((1, 2, 3))
+        for live in (0, 1)
+        for kind in ("K1Build", "K2Build") * 2
+    ]
+    real = {bb.layers[i].self_attn.attn.kv_cache.data_ptr() for i in (1, 2, 3)}
+    for key, epoch, all_pad, args in launches:
+        assert args["kv"].data_ptr() not in real
+        assert tuple(args["kv"].shape) == (1, 2, 16, 128) and not args["kv"].any()
+        assert args["kv_blocks"] == 1
+        w = key.tokens
+        if isinstance(key, spec.K1Build):
+            assert torch.equal(args["slots"], torch.full((w,), -1))
+            assert not args["positions"].any()
+        else:
+            assert torch.equal(
+                args["block_table"], torch.zeros(w, 1, dtype=torch.int32)
+            )
+            assert (args["bt_rows"], args["bt_stride"]) == (w, 1)
+            assert torch.equal(
+                args["seq_lens"], torch.full((w,), int(not all_pad), dtype=torch.int32)
+            )
+    # a K1 that leaves a pad row's qkv rows non-zero fails the self-test
+    decode, bb, *_ = _executor(monkeypatch, fill=float("nan"), extra=K1_SPLIT)
+    _bind(bb)
+    with pytest.raises(ValueError, match="width 1 gave non-finite rows"):
+        decode.prepare_kv()
+
+
+def test_executor_dspark_split_runs_gated(monkeypatch):
+    """DSpark (q = 8): the split core falls back to the gated core load; K1 stays."""
+    decode, bb, compiled, launches, _ = _executor(monkeypatch, extra=K1_SPLIT, q=8)
+    assert compiled == [
+        spec.K1Build(tokens=8, rope=False),
+        spec.K1Build(tokens=8, rope=True),
+        spec.K2Build(tokens=8, core="gated"),
+    ]
+    _bind(bb)
+    decode.prepare_kv()
+    # the kinds share K2(gated) but not K1: both kinds' first layers run
+    assert [type(k).__name__ for k, *_ in launches] == ["K1Build", "K2Build"] * 4
+
+
+def test_executor_refuses_unknown_phases_before_any_collective(monkeypatch):
+    monkeypatch.setattr(
+        decode_mod,
+        "MonoRunner",
+        lambda device: pytest.fail("peer memory before the phases' check"),
+    )
+    cfg = vllm_config()
+    cfg.additional_config["mono_core"] = "flash"
+    with pytest.raises(ValueError, match="mono_core 'flash'"):
+        SpecializedDecode(_backbone(), DecodeConfig(1, (1,)), cfg)
+
+
+def test_executor_refuses_phase_bc_weights(monkeypatch):
+    """The loaded-weights vote carries the phases' refusals."""
+    monkeypatch.setattr(
+        decode_mod, "get_tp_group", lambda: SimpleNamespace(cpu_group=None)
+    )
+    seen = []
+
+    def refuse_model(bb, layers, *args):
+        seen.append(args)
+        return ["layer 2: qkv_proj quantized"]
+
+    monkeypatch.setattr(decode_mod, "refuse_model", refuse_model)
+    monkeypatch.setattr(decode_mod, "tp_agree", lambda ok, group: ok)
+    cfg = vllm_config(**{"model_config.max_model_len": 4096})
+    cfg.additional_config.update(K1_SPLIT)
+    with pytest.raises(ValueError, match="the loaded weights: layer 2: qkv_proj"):
+        SpecializedDecode(_backbone(), DecodeConfig(8, (8,)), cfg)
+    assert seen == [("k1", "gated", 4096)]
+
+
+# --------------------------------------------------------------------------
+# The attention's front / attend split (mono off: forward unchanged)
+
+
+def _recording_attention(monkeypatch, fused=True):
+    """A ``MuseSpark1xAttention`` whose every callee records itself (16 heads
+    of 4 dims, o_gate on): the order and the arguments of what forward runs."""
+    from vllm.models.muse_spark.amd.model import MuseSpark1xAttention
+
+    attn = object.__new__(MuseSpark1xAttention)
+    nn.Module.__init__(attn)
+    rec: list = []
+    attn.num_heads, attn.head_dim, attn.num_kv_heads = 4, 4, 1
+    attn.q_size, attn.kv_size = 16, 4
+    attn.use_o_gate, attn.use_o_norm, attn.fuse_o_norm_gate = True, True, True
+    attn.use_rope, attn.rotary_emb = False, None
+    attn.fused_qk_norm_rope_kv_insert = fused
+    attn.qk_norm = None
+    attn.use_attn_temperature_tuning = False
+    attn.rms_norm_eps = 1e-5
+
+    def qkv_proj(h):
+        rec.append(("qkv_proj", h))
+        return h * 3, None
+
+    def core(q, k, v):
+        rec.append(("attn", q, k, v))
+        return q * 5
+
+    def o_proj(x):
+        rec.append(("o_proj", x))
+        return x * 7, None
+
+    def insert(qkv, *a):
+        rec.append(("insert", qkv, *a))
+        qkv.add_(1)
+
+    attn.qkv_proj, attn.attn, attn.o_proj = qkv_proj, core, o_proj
+    attn.attn.layer_name = "L"
+    monkeypatch.setattr(model_mod, "rocm_fused_qk_norm_rope_kv_insert", insert)
+
+    def gated(x, g, *a, eps):
+        rec.append(("gate", x, g, a, eps))
+        return x + g
+
+    monkeypatch.setattr(model_mod, "rms_norm_gated", gated)
+    return attn, rec
+
+
+def test_front_and_attend_are_forwards_tail(monkeypatch):
+    """The forward is attend(front(...)) then o_proj, op for op;
+    attend(gate=False) is the attention output before the gated norm."""
+    attn, rec = _recording_attention(monkeypatch)
+    h, pos = torch.arange(3 * 40.0).view(3, 40), torch.arange(3)
+    out = attn(pos, h)
+    ops = [r[0] for r in rec]
+    assert ops == ["qkv_proj", "insert", "attn", "gate", "o_proj"]
+    qkv = h * 3 + 1
+    assert rec[1][1] is not h and torch.equal(rec[1][1], qkv)
+    _, q, k, v = rec[2]
+    assert torch.equal(q, qkv[:, :16]) and k is None and v is None
+    _, x, g, a, eps = rec[3]
+    assert x.shape == (3, 4, 4) and torch.equal(g.reshape(3, 16), qkv[:, 24:])
+    assert a == (None, None, "sigmoid") and eps == 1e-5
+    want = ((qkv[:, :16] * 5).view(3, 4, 4) + qkv[:, 24:].reshape(3, 4, 4)).view(3, 16)
+    assert torch.equal(out, want * 7)
+
+    rec.clear()
+    front = attn.front(pos, h)
+    assert [r[0] for r in rec] == ["qkv_proj", "insert"] and torch.equal(front, qkv)
+    rec.clear()
+    assert torch.equal(attn.attend(front), want)
+    assert [r[0] for r in rec] == ["attn", "gate"]
+    rec.clear()
+    raw = attn.attend(front, gate=False)
+    assert [r[0] for r in rec] == ["attn"] and torch.equal(raw, qkv[:, :16] * 5)
+    assert raw.shape == (3, 16)
+    rec.clear()
+    assert torch.equal(attn(pos, h, skip_o_proj=True), want)
+    assert [r[0] for r in rec] == ["qkv_proj", "insert", "attn", "gate"]
+
+
+def test_unfused_forward_is_unchanged(monkeypatch):
+    """Without the fused insert (the draft, other configs): k / v reach the
+    attention layer, and front / attend refuse."""
+    attn, rec = _recording_attention(monkeypatch, fused=False)
+    h, pos = torch.arange(3 * 40.0).view(3, 40), torch.arange(3)
+    out = attn(pos, h)
+    assert [r[0] for r in rec] == ["qkv_proj", "attn", "gate", "o_proj"]
+    _, q, k, v = rec[1]
+    qkv = h * 3
+    assert torch.equal(k, qkv[:, 16:20]) and torch.equal(v, qkv[:, 20:24])
+    assert out.shape == (3, 16)
+    with pytest.raises(AssertionError):
+        attn.front(pos, h)
+    with pytest.raises(AssertionError):
+        attn.attend(h)
+
+
+# --------------------------------------------------------------------------
+# Phase C: the split core's binding and self-test against the kernel's
+# addressing (mono/attention/split.py, emulated on the launch's arguments)
+
+
+def _split_pages(key, args) -> dict[int, list[tuple[int, int]]]:
+    """The KV pages a K2(split) launch reads, by token t: (table entry from
+    the view's first row, block id as clamped into the cache), emulating
+    ``mono/attention/split.py`` on the launch's arguments. L is 0 on a pad row,
+    else ``seq_lens[t]`` clamped to the table's row of ``bt_stride`` pages;
+    the units are ``spec.split_plan``'s (the split's and the combine's plan).
+    Asserts what the kernel relies on: the live units' pages are the window's
+    pages b0 .. b0 + nb, once each, covering exactly the keys lo <= k < L,
+    and every entry lies in the table's buffer (``bt_rows`` rows)."""
+    s, window = key.tokens, key.window
+    n = spec.nsplit(s, window)
+    stride, rows = args["bt_stride"], args["bt_rows"]
+    table = torch.as_strided(args["block_table"], (rows, stride), (stride, 1))
+    table = table.flatten()
+    last = args["kv_blocks"] - 1
+    reads = {}
+    for t in range(s):
+        n_t = int(args["seq_lens"][t])
+        L = 0 if bool(args["pad"][t]) else min(max(n_t, 0), stride * spec.KV_BLOCK)
+        lo, b0, nb, per, live = spec.split_plan(L, window, n)
+        assert live <= n and lo == (max(L - spec.WINDOW, 0) if window else 0)
+        pages = [
+            pg
+            for p in range(live)
+            for pg in range(b0 + p * per, min(b0 + (p + 1) * per, b0 + nb))
+        ]
+        assert pages == list(range(b0, b0 + nb))
+        if L:
+            assert b0 * spec.KV_BLOCK <= lo < (b0 + 1) * spec.KV_BLOCK
+            assert (b0 + nb - 1) * spec.KV_BLOCK < L <= (b0 + nb) * spec.KV_BLOCK
+        entries = [t * stride + pg for pg in pages]
+        assert all(e < rows * stride for e in entries), (t, entries)
+        reads[t] = [(e, min(max(int(table[e]), 0), last)) for e in entries]
+    return reads
+
+
+def test_split_binding_on_the_stock_front(monkeypatch):
+    """C on vLLM's front: each layer's K2(split) launch carries exactly the
+    split ABI (static + step arguments, disjoint), A.front's qkv rows, its
+    own cache and its KV group's table, the step's seq_lens and pad; vLLM's
+    attention core never runs (DESIGN_BC 3.3, 8.4)."""
+    bb, runner, step, calls = _kernel_loop(monkeypatch, phases=Phases(core="split"))
+    _bind_fake(bb)
+    for k in step.kernels.values():
+        k.bind_kv()
+        assert k.builds() == [k.key()] and k.static_k1 is None
+        assert set(k.static) | set(STEP_ARGS_BY_CORE["split"]) == set(
+            spec.K2_ARGS_BY_CORE["split"]
+        )
+        assert not set(k.static) & set(STEP_ARGS_BY_CORE["split"])
+    mrv2 = _mrv2(bb)
+    view = _mrv2_step(mrv2)
+    step = Step(2, view.attn_metadata, view.slot_mapping, step.kernels, view.pad)
+    x = _stream(bb.layers[0])
+    for i in (1, 2, 3):
+        x = step.layer(i)(view.positions, x)
+    launches = [c for c in calls if c != "step_begin"]
+    assert calls[0] == "step_begin" and [c[0] for c in launches] == ["launch"] * 3
+    for (_, key, args), i in zip(launches, (1, 2, 3)):
+        A, kv = bb.layers[i].self_attn, bb.layers[i].self_attn.attn.kv_cache
+        assert key == spec.K2Build(tokens=2, core="split", window=i != 1)
+        assert set(args) == set(spec.K2_ARGS_BY_CORE["split"])
+        assert [c[0] for c in A.calls] == ["front"]
+        assert A.calls[0][1] is view.positions
+        assert args["qkvo"].shape == (2, spec.QKV_ROWS)
+        assert args["qkvo"].dtype == BF
+        assert args["kv"] is kv and args["kv_blocks"] == 2 + i
+        assert (args["kv_sb"], args["kv_sh"], args["kv_st"]) == tuple(
+            st * 2 for st in kv.stride()[:3]
+        )
+        table = mrv2.block_tables["full" if i == 1 else "sw"]
+        assert args["block_table"].data_ptr() == table.data_ptr()
+        assert args["bt_stride"] == table.stride(0) == 256
+        assert args["bt_rows"] == table.shape[0] == spec.MAX_ROWS
+        assert args["seq_lens"].data_ptr() == mrv2.seq_lens.data_ptr()
+        assert args["pad"] is view.pad and args["slot"] == spec.k2_slot(i)
+        # the stream is the boundary's, the layer's step arguments fresh
+        assert args["stream_out"].shape == (2, spec.HIDDEN)
+        assert args["branch_out"].shape == (2, spec.HIDDEN)
+
+
+@pytest.mark.parametrize("front", ["stock", "k1"])
+def test_split_reads_exactly_each_layers_window(monkeypatch, front):
+    """The split core's reads on a layer's bound arguments (MRV2's tables,
+    seq_lens and pad) are the request's own pages of its group: every page
+    on a full layer, the 2048-key window's on a sliding one -- never an
+    entry MRV2 nulled below the window, a stale entry past the last page, or
+    a pad row's. Contexts cross a page and the window (DESIGN_BC 3.1, 7.1)."""
+    width = 8
+    bb, runner, step, calls = _kernel_loop(
+        monkeypatch, width=width, phases=Phases(front, "split")
+    )
+    _bind_fake(bb)
+    for k in step.kernels.values():
+        k.bind_kv()
+    name = lambda i: bb.layers[i].self_attn.attn.layer_name  # noqa: E731
+    mrv2 = FakeMrv2(
+        {"full": [name(1)], "sw": [name(2), name(3)]}, {"sw"}, max_blocks=300
+    )
+    for lens in (
+        [1, 16, 17, 2048, 2049, 2064, 2065, 4097],
+        [2047, 2050, 33, 300, 4096, 15],  # two pad rows
+        [4800, 2, 2063],  # 4800: the table's whole row
+    ):
+        pages = {
+            g: [[1000 * (8 * gi + r) + 1 + b for b in range(300)] for r in range(8)]
+            for gi, g in enumerate(("full", "sw"))
+        }
+        view = mrv2.step(lens, pages, width, stale=-7)
+        step = Step(
+            width, view.attn_metadata, view.slot_mapping, step.kernels, view.pad
+        )
+        calls.clear()
+        x = _stream(bb.layers[0], width)
+        for i in (1, 2, 3):
+            x = step.layer(i)(view.positions, x)
+        k2 = [c for c in calls if c != "step_begin" and c[0] == "launch"]
+        assert len(k2) == 3
+        for (_, key, args), i in zip(k2, (1, 2, 3)):
+            g = "full" if i == 1 else "sw"
+            stride = args["bt_stride"]
+            assert stride == 300 and args["bt_rows"] == spec.MAX_ROWS
+            reads = _split_pages(key, args)
+            for t in range(width):
+                if t >= len(lens):  # a pad row reads nothing
+                    assert bool(args["pad"][t]) and reads[t] == []
+                    continue
+                L = lens[t]
+                # the window from the module (keys k > L - 1 - 2047), not spec's
+                keys = bb.layers[i].self_attn.attn.impl.sliding_window[0] + 1
+                b0 = max(L - keys, 0) // spec.KV_BLOCK if key.window else 0
+                want = pages[g][t][b0 : (L - 1) // spec.KV_BLOCK + 1]
+                row = args["block_table"][t].tolist()
+                assert [row[e - t * stride] for e, _ in reads[t]] == want
+                # the fake ids pass the fake caches' few blocks: clamped
+                last = args["kv_blocks"] - 1
+                assert [blk for _, blk in reads[t]] == [min(b, last) for b in want]
+
+
+def test_split_launch_checks_its_metadata_views(monkeypatch):
+    """The split launch's host checks: an int32 table dense in a row and int32
+    seq_lens, each holding a row a launch row; bind_kv before the launch."""
+    bb, runner, step, calls = _kernel_loop(monkeypatch, phases=Phases(core="split"))
+    _bind_fake(bb)
+    k = step.kernels[2]
+    k.bind_kv()
+    mrv2 = _mrv2(bb)
+
+    def run(edit):
+        view = _mrv2_step(mrv2)
+        md = view.attn_metadata[k.name]
+        edit(md)
+        s = Step(2, view.attn_metadata, view.slot_mapping, step.kernels, view.pad)
+        return s.layer(2)(view.positions, _stream(bb.layers[1]))
+
+    run(lambda md: None)
+    bad = {
+        "short seq_lens": lambda md: setattr(md, "seq_lens", md.seq_lens[:1]),
+        "int64 seq_lens": lambda md: setattr(md, "seq_lens", md.seq_lens.long()),
+        "strided seq_lens": lambda md: setattr(
+            md, "seq_lens", torch.zeros(4, dtype=torch.int32)[::2]
+        ),
+        "short table": lambda md: setattr(md, "block_table", md.block_table[:1]),
+        "int64 table": lambda md: setattr(md, "block_table", md.block_table.long()),
+        "strided rows": lambda md: setattr(
+            md, "block_table", torch.zeros(8, 512, dtype=torch.int32)[:, ::2]
+        ),
+        "flat table": lambda md: setattr(md, "block_table", md.block_table[0]),
+        # the core's row is bt_stride entries: a narrower view is refused
+        "column view": lambda md: setattr(md, "block_table", md.block_table[:, :100]),
+    }
+    for edit in bad.values():
+        with pytest.raises(AssertionError):
+            run(edit)
+    k.kv_args = None
+    with pytest.raises(AssertionError, match="bind_kv before the first split"):
+        run(lambda md: None)
+
+
+def test_executor_split_on_the_stock_front_lifecycle(monkeypatch):
+    """C on vLLM's front: only K2(split) builds (full and sliding per width),
+    and the self-test's K2(split) of each kind's first layer reads one page
+    of the test-local zero cache through the zero [w, 1] table on a live row
+    and nothing on a pad row -- the real caches are never addressed."""
+    decode, bb, compiled, launches, logs = _executor(
+        monkeypatch, extra={"mono_core": "split"}
+    )
+    assert compiled == [
+        spec.K2Build(tokens=w, core="split", window=window)
+        for w in (1, 2, 3)
+        for window in (False, True)
+    ]
+    assert logs[-1][-3:] == ("stock", 1, "split")
+    _bind(bb)
+    decode.prepare_kv()
+    for by in decode.kernels.values():
+        for i, k in by.items():
+            assert k.kv_args["kv"] is bb.layers[i].self_attn.attn.kv_cache
+    assert [(k.tokens, k.window, e, p) for k, e, p, _ in launches] == [
+        (w, window, 2 * n + 1 + live, not live)
+        for n, w in enumerate((1, 2, 3))
+        for live in (0, 1)
+        for window in (False, True)
+    ]
+    real = {bb.layers[i].self_attn.attn.kv_cache.data_ptr() for i in (1, 2, 3)}
+    for key, _, all_pad, args in launches:
+        assert args["kv"].data_ptr() not in real
+        assert args["slot"] == spec.k2_slot(1 if not key.window else 2)
+        assert not args["qkvo"].any() and not args["stream"].any()
+        reads = _split_pages(key, args)
+        for t in range(key.tokens):
+            assert reads[t] == ([] if all_pad else [(t, 0)])
+        # the arguments the kernel's bounds read: one block, one page a row
+        assert (args["kv_blocks"], args["bt_rows"], args["bt_stride"]) == (
+            1,
+            key.tokens,
+            1,
+        )
+
+
+@pytest.mark.parametrize("width", ALL_WIDTHS)
+@pytest.mark.parametrize("window", [False, True])
+def test_self_test_split_stays_in_its_local_block(width, window):
+    """``self_test_step`` on a split build alone (the launch contract, as
+    ``test_numerics``' stand-ins): every unit plan at every width reads only
+    block 0 of the one-block local cache, through entry t of the [w, 1]
+    table, and the all-pad step reads nothing."""
+    launches = []
+    key = spec.K2Build(tokens=width, core="split", window=window)
+    kernel = SimpleNamespace(
+        builds=lambda: [key],
+        static={"scratch": torch.zeros(8, dtype=U8), "slot": spec.k2_slot(2)},
+    )
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(layers_mod, "k2_launch", lambda k, a: launches.append((k, a)))
+        for live in (False, True):
+            pad = torch.full((16,), int(not live), dtype=U8)
+            outs = layers_mod.self_test_step(kernel, pad, live)
+            assert len(outs) == 2
+    for (k, args), live in zip(launches, (False, True)):
+        assert k == key
+        assert set(args) - set(kernel.static) == set(STEP_ARGS_BY_CORE["split"])
+        assert tuple(args["kv"].shape) == (1, spec.KV_HEADS, spec.KV_BLOCK, spec.KV_C)
+        assert not args["kv"].any()
+        reads = _split_pages(k, args)
+        assert reads == {t: [(t, 0)] if live else [] for t in range(width)}

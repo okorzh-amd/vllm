@@ -23,6 +23,29 @@ input) to the layer's deferred FFN boundary, in one launch a layer and rank.
     unpool        every CTA: its row group's K quarter -> every rank's branch
     gather        CTAs 0 .. 63: the branch rows -> ``branch_out``
 
+The attention core K2 starts from is the build's ``K2Build.core`` (one kernel
+template, a variant a core; ``ABI_BY_CORE``): "tensor" (Phase A) reads
+vLLM's gated core ``core``; "gated" (Phase B2, DESIGN_BC 6) reads vLLM's
+attention output ``attn`` and the qkv rows ``qkvo`` and computes the output
+norm and gate in its core load (``attention/gate.py``), those loads issued
+before the o_proj weights; "split" (Phase C, the q = 1 widths, DESIGN_BC 7)
+reads the qkv rows ``qkvo``, the layer's KV cache and its KV group's block
+table and sequence lengths and runs the attention core itself:
+
+    split         CTAs 0 .. n_units - 1: one split-KV unit each
+                  (``attention/split.py``) -> partials, ``srdy``
+    combine       CTAs C0 = 256 - 16 S ..: one (token, q head) each
+                  (``attention/combine.py``): the units' partials merged, the
+                  output norm and gate -> ``xo``, ``crdy``; a CTA in both
+                  ranges runs its unit first
+
+Every CTA issues its o_proj weights after its last role stage's publish
+(``split_roles``, DESIGN_BC 7.2, rule 8: a publish waits for every load in
+flight): a CTA with no role at entry, a split unit after its ``srdy``, a
+combine after its ``crdy``; its core load then polls ``crdy`` with only its own
+weights in flight. Only phase 1 differs between the cores; every stage from
+``stage_o`` on is the same code.
+
 Every hand-off is a tagged pair (5.10/5.11 of the design); the tag carries the
 step epoch the runner bumps once a step and the launch's slot, so nothing is
 zeroed between launches. Every poll waits on a stage earlier in this order on
@@ -49,10 +72,15 @@ from pathlib import Path
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
+from flydsl.expr import const_expr
 from flydsl.expr.typing import Int32, Int64
 
 from vllm.models.muse_spark.amd.specialized_decode.mono import spec
-from vllm.models.muse_spark.amd.specialized_decode.mono.attention import back
+from vllm.models.muse_spark.amd.specialized_decode.mono.attention import (
+    back,
+    combine,
+    split,
+)
 from vllm.models.muse_spark.amd.specialized_decode.mono.common.context import (
     lds_total_bytes,
     make_context,
@@ -91,7 +119,13 @@ from vllm.models.muse_spark.amd.specialized_decode.mono.stages import (
 # parameter name. ``k2_launch`` takes the K2_ARGS names; ``c["args"]`` keys them
 # by K2_ARGS too (the stages read ``c["args"]["stream"]``).
 KERNEL_NAMES = {"stream": "stream_in"}
-ABI = KernelAbi(tuple(KERNEL_NAMES.get(n, n) for n in spec.K2_ARGS))
+# The kernel's parameters by K2Build.core (spec.K2_ARGS_BY_CORE, renamed as
+# above): the cores ``build`` has a variant for.
+ABI_BY_CORE = {
+    core: KernelAbi(tuple(KERNEL_NAMES.get(n, n) for n in spec.K2_ARGS_BY_CORE[core]))
+    for core in back.CORES
+}
+ABI = ABI_BY_CORE["tensor"]  # Phase A's
 # Every .py under mono/: joins every build key (an edit to any stage or helper
 # rebuilds, wherever FlyDSL's own source walk does not reach)
 SOURCES = source_digest(".")
@@ -116,14 +150,23 @@ STAGES = (
     "unpool",
     "gather",
 )
+# ... and a split build's: its core's two stages before o_proj (DESIGN_BC 7.2)
+SPLIT_STAGES = (split.STAGE, combine.STAGE, *STAGES)
+
+
+def stages(core: str = "tensor") -> tuple[str, ...]:
+    """The program order a build of ``core`` traces."""
+    return SPLIT_STAGES if core == "split" else STAGES
+
 
 _STREAM = fx.Stream(None)
 
 
-def lds_structs(s: int) -> dict:
+def lds_structs(s: int, core: str = "tensor") -> dict:
     """The stage union's members at ``s`` rows (design 5.13): stage key ->
-    ``fx.struct`` (or the ``xq_ug`` composite of two)."""
-    return {
+    ``fx.struct`` (or the ``xq_ug`` composite of two). A split build adds its
+    core's stages (DESIGN_BC 7.7); the others' union is Phase A's."""
+    lds = {
         "back": back.lds_struct(s),
         "seam": seam.lds_struct(s),
         "pool": pool.lds_struct(s),
@@ -132,27 +175,57 @@ def lds_structs(s: int) -> dict:
         "reduce": reduce.lds_struct(s),
         "unpool": unpool.lds_struct(s),
     }
+    if core == "split":
+        lds[split.STAGE] = split.lds_struct(s)
+        lds[combine.STAGE] = combine.lds_struct(s)
+    return lds
 
 
-def lds_bytes(s: int) -> int:
+def lds_bytes(s: int, core: str = "tensor") -> int:
     """K2's static LDS at ``s`` rows: ``red``, ``RouteLds``, the stage union
     (an upper bound of the ISA's group segment: fields no stage touches are
     dropped)."""
-    return lds_total_bytes(lds_structs(s))
+    return lds_total_bytes(lds_structs(s, core))
 
 
 @traced
-def program(c, debug_dump: bool) -> None:
+def split_roles(c) -> None:
+    """A split build's core stages before any o_proj weight (DESIGN_BC 7.2):
+    CTA b < n_units runs split unit b, CTA b >= C0 combine b - C0 (unit
+    first when both). Neither polls nor publishes with a weight in flight
+    (rule 8); a CTA with no role passes straight on to its weights. Every
+    branch is CTA-uniform."""
+    s, b = c["S"], c["bid"]
+    window = split.window_of(c)
+    n, c0 = spec.n_units(s, window), spec.C0(s)
+    if const_expr(n < BLOCKS):
+        if b < n:
+            split.stage_split(c, b)
+    else:  # every CTA holds a unit
+        split.stage_split(c, b)
+    if b >= c0:
+        combine.stage_combine(c, fx.Int32(b) - c0)
+
+
+@traced
+def program(c, debug_dump: bool, core: str = "tensor") -> None:
     """K2's stages on CTA ``c["bid"]`` in the design's program order (5.2).
     Every call is CTA-uniform (predicated on the CTA, never on the thread), so
-    every thread reaches every barrier."""
+    every thread reaches every barrier. ``core``: the build's (static)."""
     s = c["S"]
     b = c["bid"]
     b32 = fx.Int32(b)
-    # -- phase 1: o_proj, both tasks' weights in flight before the first MFMA
+    # -- phase 1: o_proj, both tasks' weights in flight before the first MFMA;
+    # a split core's stages before them (DESIGN_BC 7.2), a gated core's own
+    # loads (none for "tensor" and "split": DESIGN_BC 6.2)
+    if const_expr(core == "split"):
+        split_roles(c)
+    # (not ``pre``: the seam's, assigned under a traced ``if`` below, must not
+    # become that branch's state)
+    core_pre = back.core_loads(c, core)
     ops0 = back.o_loads(c, b)
     ops1 = back.o_loads(c, b + BLOCKS)
-    back.load_core(c)
+    back.load_core(c, core, core_pre)
     back.stage_o(c, b, ops0)
     back.stage_o(c, b + BLOCKS, ops1)
     # -- phase 2: the seam (and routing), the router rows, the pooler
@@ -221,19 +294,36 @@ def _bind_cache(launch) -> None:
 
 
 def build(key: K2Build):
-    """The ``@flyc.jit`` launcher of build ``key`` (``ABI`` order, then
-    ``stream``), cached. Every field of ``key`` and the mono sources are in the
-    JIT key (``key_tuple``), referenced by both the kernel and the launcher."""
+    """The ``@flyc.jit`` launcher of build ``key`` (``ABI_BY_CORE[key.core]``
+    order, then ``stream``), cached. Every field of ``key`` and the mono
+    sources are in the JIT key (``key_tuple``), referenced by both the kernel
+    and the launcher. A core with no variant yet raises NotImplementedError
+    (never another core's kernel under this key's name and ABI)."""
     if key in _BUILDS:
         return _BUILDS[key]
     if not isinstance(key, K2Build):
         raise TypeError(f"a K2 build key is a K2Build, not {type(key).__name__}")
+    if key.core not in ABI_BY_CORE:
+        raise NotImplementedError(
+            f"K2 core {key.core!r}: no kernel variant yet (built: {tuple(ABI_BY_CORE)})"
+        )
     s = key.tokens
-    lds = lds_structs(s)
-    if lds_bytes(s) > LDS_BYTES:
-        raise ValueError(f"K2 at {s} rows: {lds_bytes(s)} B of LDS > {LDS_BYTES}")
+    lds = lds_structs(s, key.core)
+    nbytes = lds_bytes(s, key.core)
+    if nbytes > LDS_BYTES:
+        raise ValueError(f"K2 at {s} rows: {nbytes} B of LDS > {LDS_BYTES}")
     keyed = key_tuple(key, SOURCES)
     debug_dump = key.debug_dump
+    variant = _VARIANTS[key.core]
+    kernel, launch = variant(key, s, lds, keyed, debug_dump)
+    ABI_BY_CORE[key.core].check(kernel, launch)
+    _bind_cache(launch)
+    _BUILDS[key] = launch
+    return launch
+
+
+def _tensor(key: K2Build, s: int, lds: dict, keyed: tuple, debug_dump: bool):
+    """The "tensor" variant (Phase A): (kernel, launcher)."""
 
     @flyc.kernel(name=key.kernel_name(), known_block_size=[THREADS, 1, 1])
     def k2(
@@ -357,19 +447,319 @@ def build(key: K2Build):
             alarm,
         ).launch(grid=(BLOCKS,), block=(THREADS,), stream=stream)
 
-    ABI.check(k2, launch)
-    _bind_cache(launch)
-    _BUILDS[key] = launch
-    return launch
+    return k2, launch
+
+
+def _gated(key: K2Build, s: int, lds: dict, keyed: tuple, debug_dump: bool):
+    """The "gated" variant (Phase B2): ``attn`` and ``qkvo`` in place of
+    ``core``, the gate in the core load. (kernel, launcher)."""
+
+    @flyc.kernel(name=key.kernel_name(), known_block_size=[THREADS, 1, 1])
+    def k2g(
+        attn: Int64,
+        qkvo: Int64,
+        stream_in: Int64,
+        pad: Int64,
+        w_o: Int64,
+        attn_alpha: Int64,
+        attn_beta: Int64,
+        w_preffn: Int64,
+        w_router: Int64,
+        bias: Int64,
+        w_pool: Int64,
+        w_preexp: Int64,
+        w13: Int64,
+        w13s: Int64,
+        w2: Int64,
+        w2s: Int64,
+        w_postexp: Int64,
+        w_unpool: Int64,
+        stream_out: Int64,
+        branch_out: Int64,
+        scratch: Int64,
+        peers: Int64,
+        rank: Int32,
+        epoch: Int64,
+        slot: Int32,
+        health: Int64,
+        alarm: Int64,
+    ):
+        _ = keyed
+        args = {
+            "attn": attn,
+            "qkvo": qkvo,
+            "stream": stream_in,
+            "pad": pad,
+            "w_o": w_o,
+            "attn_alpha": attn_alpha,
+            "attn_beta": attn_beta,
+            "w_preffn": w_preffn,
+            "w_router": w_router,
+            "bias": bias,
+            "w_pool": w_pool,
+            "w_preexp": w_preexp,
+            "w13": w13,
+            "w13s": w13s,
+            "w2": w2,
+            "w2s": w2s,
+            "w_postexp": w_postexp,
+            "w_unpool": w_unpool,
+            "stream_out": stream_out,
+            "branch_out": branch_out,
+            "scratch": scratch,
+            "peers": peers,
+            "rank": rank,
+            "epoch": epoch,
+            "slot": slot,
+            "health": health,
+            "alarm": alarm,
+        }
+        c = make_context(s, args, lds, key=key)
+        program(c, debug_dump, "gated")
+
+    @flyc.jit
+    def launch(
+        attn: Int64,
+        qkvo: Int64,
+        stream_in: Int64,
+        pad: Int64,
+        w_o: Int64,
+        attn_alpha: Int64,
+        attn_beta: Int64,
+        w_preffn: Int64,
+        w_router: Int64,
+        bias: Int64,
+        w_pool: Int64,
+        w_preexp: Int64,
+        w13: Int64,
+        w13s: Int64,
+        w2: Int64,
+        w2s: Int64,
+        w_postexp: Int64,
+        w_unpool: Int64,
+        stream_out: Int64,
+        branch_out: Int64,
+        scratch: Int64,
+        peers: Int64,
+        rank: Int32,
+        epoch: Int64,
+        slot: Int32,
+        health: Int64,
+        alarm: Int64,
+        stream: fx.Stream = _STREAM,
+    ):
+        _ = keyed
+        k2g(
+            attn,
+            qkvo,
+            stream_in,
+            pad,
+            w_o,
+            attn_alpha,
+            attn_beta,
+            w_preffn,
+            w_router,
+            bias,
+            w_pool,
+            w_preexp,
+            w13,
+            w13s,
+            w2,
+            w2s,
+            w_postexp,
+            w_unpool,
+            stream_out,
+            branch_out,
+            scratch,
+            peers,
+            rank,
+            epoch,
+            slot,
+            health,
+            alarm,
+        ).launch(grid=(BLOCKS,), block=(THREADS,), stream=stream)
+
+    return k2g, launch
+
+
+def _split(key: K2Build, s: int, lds: dict, keyed: tuple, debug_dump: bool):
+    """The "split" variant (Phase C): ``qkvo``, the layer's KV cache and its
+    KV group's block table and sequence lengths in place of ``core``, the
+    split-KV core in-kernel (``split_roles``). (kernel, launcher)."""
+
+    @flyc.kernel(name=key.kernel_name(), known_block_size=[THREADS, 1, 1])
+    def k2s(
+        qkvo: Int64,
+        kv: Int64,
+        kv_sb: Int64,
+        kv_sh: Int64,
+        kv_st: Int64,
+        kv_blocks: Int32,
+        block_table: Int64,
+        bt_rows: Int32,
+        bt_stride: Int32,
+        seq_lens: Int64,
+        stream_in: Int64,
+        pad: Int64,
+        w_o: Int64,
+        attn_alpha: Int64,
+        attn_beta: Int64,
+        w_preffn: Int64,
+        w_router: Int64,
+        bias: Int64,
+        w_pool: Int64,
+        w_preexp: Int64,
+        w13: Int64,
+        w13s: Int64,
+        w2: Int64,
+        w2s: Int64,
+        w_postexp: Int64,
+        w_unpool: Int64,
+        stream_out: Int64,
+        branch_out: Int64,
+        scratch: Int64,
+        peers: Int64,
+        rank: Int32,
+        epoch: Int64,
+        slot: Int32,
+        health: Int64,
+        alarm: Int64,
+    ):
+        _ = keyed
+        args = {
+            "qkvo": qkvo,
+            "kv": kv,
+            "kv_sb": kv_sb,
+            "kv_sh": kv_sh,
+            "kv_st": kv_st,
+            "kv_blocks": kv_blocks,
+            "block_table": block_table,
+            "bt_rows": bt_rows,
+            "bt_stride": bt_stride,
+            "seq_lens": seq_lens,
+            "stream": stream_in,
+            "pad": pad,
+            "w_o": w_o,
+            "attn_alpha": attn_alpha,
+            "attn_beta": attn_beta,
+            "w_preffn": w_preffn,
+            "w_router": w_router,
+            "bias": bias,
+            "w_pool": w_pool,
+            "w_preexp": w_preexp,
+            "w13": w13,
+            "w13s": w13s,
+            "w2": w2,
+            "w2s": w2s,
+            "w_postexp": w_postexp,
+            "w_unpool": w_unpool,
+            "stream_out": stream_out,
+            "branch_out": branch_out,
+            "scratch": scratch,
+            "peers": peers,
+            "rank": rank,
+            "epoch": epoch,
+            "slot": slot,
+            "health": health,
+            "alarm": alarm,
+        }
+        c = make_context(s, args, lds, key=key)
+        program(c, debug_dump, "split")
+
+    @flyc.jit
+    def launch(
+        qkvo: Int64,
+        kv: Int64,
+        kv_sb: Int64,
+        kv_sh: Int64,
+        kv_st: Int64,
+        kv_blocks: Int32,
+        block_table: Int64,
+        bt_rows: Int32,
+        bt_stride: Int32,
+        seq_lens: Int64,
+        stream_in: Int64,
+        pad: Int64,
+        w_o: Int64,
+        attn_alpha: Int64,
+        attn_beta: Int64,
+        w_preffn: Int64,
+        w_router: Int64,
+        bias: Int64,
+        w_pool: Int64,
+        w_preexp: Int64,
+        w13: Int64,
+        w13s: Int64,
+        w2: Int64,
+        w2s: Int64,
+        w_postexp: Int64,
+        w_unpool: Int64,
+        stream_out: Int64,
+        branch_out: Int64,
+        scratch: Int64,
+        peers: Int64,
+        rank: Int32,
+        epoch: Int64,
+        slot: Int32,
+        health: Int64,
+        alarm: Int64,
+        stream: fx.Stream = _STREAM,
+    ):
+        _ = keyed
+        k2s(
+            qkvo,
+            kv,
+            kv_sb,
+            kv_sh,
+            kv_st,
+            kv_blocks,
+            block_table,
+            bt_rows,
+            bt_stride,
+            seq_lens,
+            stream_in,
+            pad,
+            w_o,
+            attn_alpha,
+            attn_beta,
+            w_preffn,
+            w_router,
+            bias,
+            w_pool,
+            w_preexp,
+            w13,
+            w13s,
+            w2,
+            w2s,
+            w_postexp,
+            w_unpool,
+            stream_out,
+            branch_out,
+            scratch,
+            peers,
+            rank,
+            epoch,
+            slot,
+            health,
+            alarm,
+        ).launch(grid=(BLOCKS,), block=(THREADS,), stream=stream)
+
+    return k2s, launch
+
+
+# the kernel variant of each K2Build.core (``build``)
+_VARIANTS = {"tensor": _tensor, "gated": _gated, "split": _split}
+assert set(_VARIANTS) == set(ABI_BY_CORE)
 
 
 def k2_launch(key: K2Build, args: Mapping[str, torch.Tensor | int]) -> None:
     """One K2 launch of build ``key`` on the current stream. ``args``: every
-    ``spec.K2_ARGS`` name, nothing else (``ABI.pack``); a tensor passes its
-    address, an int (``rank``, ``slot``, ``alarm``) itself."""
+    ``spec.K2_ARGS_BY_CORE[key.core]`` name, nothing else
+    (``ABI_BY_CORE[key.core].pack``); a tensor passes its address, an int
+    (``rank``, ``slot``, ``alarm``) itself."""
     f = build(key)
     vals = {
         KERNEL_NAMES.get(n, n): v.data_ptr() if isinstance(v, torch.Tensor) else int(v)
         for n, v in args.items()
     }
-    f(*ABI.pack(vals), stream=torch.cuda.current_stream())
+    f(*ABI_BY_CORE[key.core].pack(vals), stream=torch.cuda.current_stream())

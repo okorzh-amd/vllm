@@ -13,20 +13,27 @@ noted):
     put, put_bf,          the launch's ``Mailbox`` methods (bound: the AST
     put_words, poll       rewriter must see no method call on a local)
     red                   LDS f32[WAVES 64 4]: MFMA accumulators (``row_sum``)
-    rt                    ``RouteLds`` field -> LDS pointer
+    rt                    ``RouteLds`` field -> LDS pointer ({} without it)
     lds                   stage -> field -> LDS pointer (the stage union)
     args                  ABI name -> kernel argument (Int64 address / Int32)
-    scr                   scratch mailbox region -> ``Addr``; ``xrow``, ``xqd``:
-                          plain Int64 bases
+    scr                   scratch mailbox region -> ``Addr`` (Phases A, B and
+                          C: ``spec.SCRATCH_REGIONS_ALL``); the plain regions
+                          (``xrow``, ``xqd``, ``spec.SCRATCH_PLAIN_BC``):
+                          Int64 bases
     peer                  peer region -> [an ``Addr`` a rank], and
-                          region + "_own" -> this rank's, parity-shifted
+                          region + "_own" -> this rank's, parity-shifted ({}
+                          without peers)
 
-LDS: the fixed ``red`` and ``RouteLds``, then one union of the stages' structs
-(``lds_structs``: stage -> ``fx.struct``, or stage -> {member: ``fx.struct``}
-for a sequential composite whose members are all live at once, e.g. K2's
-``xq_ug``). A composite's fields are reachable both under its own name and
-under each member's. Union members share bytes: a stage that touches its
-struct or ``red`` ends with ``gpu.barrier()`` (the hand-over rule).
+A rank-local kernel (K1) builds its context with ``peers=False`` (no
+``peers`` argument, no peer regions) and ``route_lds=False`` (no route table
+in its LDS).
+
+LDS: the fixed ``red`` and ``RouteLds`` (if any), then one union of the
+stages' structs (``lds_structs``: stage -> ``fx.struct``, or stage ->
+{member: ``fx.struct``} for a sequential composite whose members are all live
+at once, e.g. K2's ``xq_ug``). A composite's fields are reachable both under
+its own name and under each member's. Union members share bytes: a stage that
+touches its struct or ``red`` ends with ``gpu.barrier()`` (the hand-over rule).
 
 A probe (``probe_kernel``) is a kernel whose body is one caller-given function
 of ``c``: the fixed probe ABI (``PROBE_ARGS``), any K2 argument the stage needs
@@ -34,7 +41,8 @@ loaded from an int64 table (``argv``), one CTA or the full grid. With
 ``peers_alias`` every rank's peer address is this rank's own buffer, so a
 probe that pushes to "every rank" and polls its own region runs on one GPU;
 ``ProbeBuffers`` holds its buffers and writes the pairs other ranks would have
-pushed.
+pushed. A probe of a K1 stage takes K1's context (``peers=False``,
+``route_lds=False``, a ``K1Build``).
 """
 
 import enum
@@ -96,8 +104,9 @@ class FixedLds:
 
 
 # The arguments make_context reads; a kernel's ``args`` carries them and any
-# other K2 argument its stages use.
+# other K2 argument its stages use. Without peers (K1), all but ``peers``.
 CONTEXT_ARGS = ("scratch", "peers", "rank", "epoch", "slot", "health", "alarm")
+LOCAL_CONTEXT_ARGS = tuple(n for n in CONTEXT_ARGS if n != "peers")
 
 
 # ---------------------------------------------------------------- LDS
@@ -130,11 +139,12 @@ def _align_up(n: int, a: int) -> int:
     return (n + a - 1) // a * a
 
 
-def lds_total_bytes(lds_structs: Mapping | None = None) -> int:
-    """The LDS a context with ``lds_structs`` allocates: ``red``, ``RouteLds``,
-    then the stage union, each at its alignment (``SharedAllocator``'s bump)."""
+def lds_total_bytes(lds_structs: Mapping | None = None, route_lds: bool = True) -> int:
+    """The LDS a context with ``lds_structs`` allocates: ``red``, ``RouteLds``
+    (with ``route_lds``), then the stage union, each at its alignment
+    (``SharedAllocator``'s bump)."""
     off = 0
-    parts = [FixedLds, RouteLds]
+    parts = [FixedLds, RouteLds] if route_lds else [FixedLds]
     union = stage_union(lds_structs)
     if union is not None:
         parts.append(union)
@@ -193,31 +203,58 @@ def _stage_ptrs(alloc, lds_structs: Mapping | None) -> dict:
 # ---------------------------------------------------------------- the context
 
 
+def _peer_regions(peers, rank, par, alias: bool) -> dict:
+    """Peer region -> [an ``Addr`` a rank] and region + "_own" -> this rank's,
+    in the epoch parity ``par``'s half (``alias``: every rank's base is
+    ``peers[0]``)."""
+    if alias:
+        bases = [load_ptr64(peers, 0)] * spec.TP
+        own = bases[0]
+    else:
+        bases = peer_bases(peers, spec.TP)
+        own = load_ptr64(peers, rank)
+    delta = fx.Int64(par) * spec.peer_half_bytes()
+    peer: dict = {}
+    for region, (off, _) in spec.peer_layout().items():
+        peer[region] = [shift(preg(b, off, region), delta) for b in bases]
+        peer[region + "_own"] = shift(preg(own, off, region), delta)
+    return peer
+
+
 def make_context(
     S: int,
     args: Mapping,
     lds_structs: Mapping | None = None,
     *,
     peers_alias: bool = False,
-    key: spec.K2Build | None = None,
+    key: spec.K2Build | spec.K1Build | None = None,
+    peers: bool = True,
+    route_lds: bool = True,
 ) -> dict:
     """The stage context ``c`` (module docstring), traced in a kernel body.
 
-    ``args``: ABI name -> kernel argument, at least ``CONTEXT_ARGS``.
+    ``args``: ABI name -> kernel argument, at least ``CONTEXT_ARGS``
+    (``LOCAL_CONTEXT_ARGS`` without ``peers``).
     ``lds_structs``: stage -> struct (or {member: struct}), the stage union.
     ``peers_alias``: every rank's peer base is ``peers[0]`` (one-GPU probes).
-    ``key``: a fault build compiles ``sync.stall`` in first (its prologue).
+    ``key``: a K2 or K1 build; a fault build compiles ``sync.stall`` in first
+    (its prologue).
+    ``peers``: build the peer regions from the ``peers`` argument (False: a
+    rank-local kernel, no ``peers`` argument read and ``peer`` empty).
+    ``route_lds``: allocate ``RouteLds`` (False: ``rt`` empty).
     """
     if not 1 <= S <= spec.MAX_ROWS:
         raise ValueError(f"launch rows {S} (1 .. {spec.MAX_ROWS})")
-    missing = [n for n in CONTEXT_ARGS if n not in args]
+    if peers_alias and not peers:
+        raise ValueError("peers_alias needs the peers (peers=True)")
+    needs = CONTEXT_ARGS if peers else LOCAL_CONTEXT_ARGS
+    missing = [n for n in needs if n not in args]
     if missing:
         raise KeyError(f"make_context needs the arguments {missing}")
-    if lds_total_bytes(lds_structs) > LDS_BYTES:
-        raise ValueError(
-            f"{lds_total_bytes(lds_structs)} B of LDS > {LDS_BYTES} (a CU's)"
-        )
-    scratch, peers, rank = args["scratch"], args["peers"], args["rank"]
+    lds_bytes = lds_total_bytes(lds_structs, route_lds)
+    if lds_bytes > LDS_BYTES:
+        raise ValueError(f"{lds_bytes} B of LDS > {LDS_BYTES} (a CU's)")
+    scratch, rank = args["scratch"], args["rank"]
     epoch, slot, health, alarm = (
         args["epoch"],
         args["slot"],
@@ -228,7 +265,7 @@ def make_context(
     bid = fx.block_idx.x
     alloc = fx.SharedAllocator()
     fixed = alloc.allocate(FixedLds).peek()
-    rl = alloc.allocate(RouteLds).peek()
+    rl = alloc.allocate(RouteLds).peek() if route_lds else None
     lds = _stage_ptrs(alloc, lds_structs)
     if key is not None and key.faulty:
         stall(
@@ -249,21 +286,16 @@ def make_context(
         load_budget(health),
     )
     par = e & 1
-    if peers_alias:
-        bases = [load_ptr64(peers, 0)] * spec.TP
-        own = bases[0]
-    else:
-        bases = peer_bases(peers, spec.TP)
-        own = load_ptr64(peers, rank)
-    delta = fx.Int64(par) * spec.peer_half_bytes()
-    peer: dict = {}
-    for region, (off, _) in spec.peer_layout().items():
-        peer[region] = [shift(preg(b, off, region), delta) for b in bases]
-        peer[region + "_own"] = shift(preg(own, off, region), delta)
+    peer = _peer_regions(args["peers"], rank, par, peers_alias) if peers else {}
     lay = spec.scratch_layout()
     scr: dict = {r: sreg(scratch, lay[r][0], r) for r in spec.SCRATCH_REGIONS}
     scr[spec.XROW] = scratch + fx.Int64(lay[spec.XROW][0])
     scr[spec.XQD] = scratch + fx.Int64(lay[spec.XQD][0])
+    # Phases B and C, laid out past xrow (Phase A's offsets stay)
+    for r in spec.SCRATCH_REGIONS_BC:
+        scr[r] = sreg(scratch, lay[r][0], r)
+    for r, _, _ in spec.SCRATCH_PLAIN_BC:
+        scr[r] = scratch + fx.Int64(lay[r][0])
     return {
         "S": S,
         "tid": tid,
@@ -279,7 +311,7 @@ def make_context(
         "put_words": mb.put_words,
         "poll": mb.poll,
         "red": fixed.red.ptr,
-        "rt": route_ptrs(rl),
+        "rt": route_ptrs(rl) if rl is not None else {},
         "lds": lds,
         "args": dict(args),
         "scr": scr,
@@ -496,6 +528,9 @@ def probe_kernel(
     blocks: int = 1,
     peers_alias: bool = True,
     key: tuple = (),
+    peers: bool = True,
+    route_lds: bool = True,
+    build: spec.K2Build | spec.K1Build | None = None,
 ) -> Probe:
     """A single-stage kernel: ``make_context(S, args, lds_structs)`` and then
     ``body(c)``, on ``blocks`` CTAs (1, or the full grid) of THREADS threads.
@@ -507,7 +542,10 @@ def probe_kernel(
     (name, S, blocks, arguments, aliasing, the body -- its code, the values
     its closure and defaults hold, the module-level scalars and same-module
     functions it reads -- the LDS structs and the mono sources are keyed
-    already)."""
+    already). ``peers``, ``route_lds``: as ``make_context``'s (the probe ABI
+    keeps its ``peers`` argument; without peers it is not read, and
+    ``peers_alias`` does not apply). ``build``: the context's build key (a
+    fault build's ``sync.stall`` prologue, its ``debug_dump``)."""
     extra = tuple(extra_args)
     clash = sorted(set(extra) & set(PROBE_ARGS))
     if clash:
@@ -518,16 +556,21 @@ def probe_kernel(
         raise ValueError(f"probe grid {blocks} (1 .. {spec.BLOCKS})")
     if not 1 <= S <= spec.MAX_ROWS:
         raise ValueError(f"probe rows {S} (1 .. {spec.MAX_ROWS})")
-    if lds_total_bytes(lds_structs) > LDS_BYTES:
+    if lds_total_bytes(lds_structs, route_lds) > LDS_BYTES:
         raise ValueError(
-            f"probe {name}: {lds_total_bytes(lds_structs)} B of LDS > {LDS_BYTES}"
+            f"probe {name}: {lds_total_bytes(lds_structs, route_lds)} B of LDS"
+            f" > {LDS_BYTES}"
         )
+    alias = peers_alias and peers
     keyed = (
         ("probe", name),
         ("tokens", S),
         ("blocks", blocks),
         ("extra_args", extra),
-        ("peers_alias", peers_alias),
+        ("peers_alias", alias),
+        ("peers", peers),
+        ("route_lds", route_lds),
+        ("build", repr(build)),
         ("body", _body_digest(body)),
         ("lds", _lds_signature(lds_structs)),
         ("sources", SOURCES),
@@ -536,7 +579,7 @@ def probe_kernel(
     if keyed in _PROBES:
         return _PROBES[keyed]
     tokens = S
-    alias = peers_alias
+    has_peers = peers  # the kernel's ``peers`` is its argument
 
     @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
     def probe(
@@ -560,7 +603,16 @@ def probe_kernel(
             "alarm": alarm,
             **_load_argv(argv, extra),
         }
-        body(make_context(tokens, args, lds_structs, peers_alias=alias))
+        c = make_context(
+            tokens,
+            args,
+            lds_structs,
+            peers_alias=alias,
+            key=build,
+            peers=has_peers,
+            route_lds=route_lds,
+        )
+        body(c)
 
     @flyc.jit
     def launch(

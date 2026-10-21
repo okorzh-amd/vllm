@@ -26,6 +26,12 @@ Outputs: ``stream_out`` (fp32, plain stores), ``xrow`` (bf16 ffn_in rows,
 device scope, scratch) and slice j's ``xrdy`` flag (``publish``: the xrow
 stores drained, then the flag) for the router and the pooler.
 
+``blend_norm`` (the boundary past its input, from the first sum of squares
+to the bf16 row) is shared with K1's boundary (``front/boundary.py``,
+DESIGN_BC 5.4): same order, same rounding points, its own regions, eps and
+outputs. Factoring it out left every K2 binary as it was
+(``test_compile.py::test_k2_tensor_isa_unchanged``).
+
 The stage keeps everything in registers: ``lds_struct`` is the design's
 reserved 256 B member (stage key ``"seam"``), which ``stage_seam`` does not
 touch (no LDS hand-over barrier is owed).
@@ -143,12 +149,63 @@ def _slices_total(c, region, t):
 
 
 @traced
+def blend_norm(c, j, pre, x0, x1, regions, post_eps, pre_eps, outs):
+    """The residual boundary past its input ``x`` (lane columns ``col``,
+    ``col + 1`` of row ``t``; zero on a pad row), shared by K2's seam and K1's
+    boundary (``front/boundary.py``)::
+
+        y      = x rsq(sum(x^2) / 8192 + post_eps)
+        n      = alpha stream + beta y          -> outs[0] (fp32, plain)
+        z      = bf16((n rsq(sum(n^2) / 8192 + pre_eps)) w)  -> outs[1] (CM_DEV)
+
+    ``pre``: the slice's loads (``t``, ``col``, ``s``, ``alpha``, ``beta``,
+    ``w`` = the next norm's weight + gain center, ``pad``). ``regions``: the two
+    sum-of-squares mailboxes (slice j's partial of row t at ``ss_pair(j, t)``).
+    ``outs``: (stream_out base, bf16 row base, row element index of (t, col)).
+    Called by the live waves (t < S); the caller publishes the slice's flag."""
+    lane = c["lane"]
+    first, second = regions
+    stream_out, rows, row_elem = outs
+    t, col, dead = pre["t"], pre["col"], pre["pad"]
+    zero = fx.Float32(0.0)
+    p = wave_sum(x0 * x0 + x1 * x1)
+    if lane == 0:
+        c["put"](first, ss_pair(j, t), p)
+    tot = _slices_total(c, first, t)
+    r = hw_rsq(tot * fx.Float32(INV_H) + fx.Float32(post_eps))
+    s0, s1 = pre["s"]
+    a0, a1 = pre["alpha"]
+    b0, b1 = pre["beta"]
+    n0 = dead.select(zero, a0 * s0 + b0 * (x0 * r))
+    n1 = dead.select(zero, a1 * s1 + b1 * (x1 * r))
+    bo.buffer_store(
+        fx.Vector.from_elements([n0, n1], fx.Float32),
+        rsrc(stream_out),
+        t * HIDDEN + col,
+    )
+    q = wave_sum(n0 * n0 + n1 * n1)
+    if lane == 0:
+        c["put"](second, ss_pair(j, t), q)
+    tot2 = _slices_total(c, second, t)
+    r2 = hw_rsq(tot2 * fx.Float32(INV_H) + fx.Float32(pre_eps))
+    w0, w1 = pre["w"]
+    f0 = dead.select(zero, (n0 * r2) * w0)
+    f1 = dead.select(zero, (n1 * r2) * w1)
+    bo.buffer_store(
+        bf16_pair(f0, f1),
+        rsrc(rows),
+        row_elem(t, col) // 2,
+        cache_modifier=CM_DEV,
+    )
+
+
+@traced
 def stage_seam(c, j, pre):
     """Slice j: ar (8 ranks, rank order) -> attn_out -> post-attention norm
     and the gated blend -> ``stream_out``; the pre-FFN norm -> ``xrow``; then
     the slice's ``xrdy`` flag."""
     enter_stage(STAGE)
-    s, tid, lane, wave = c["S"], c["tid"], c["lane"], c["wave"]
+    s, tid, wave = c["S"], c["tid"], c["wave"]
     a, scr, peer = c["args"], c["scr"], c["peer"]
     t, col, dead = pre["t"], pre["col"], pre["pad"]
     zero = fx.Float32(0.0)
@@ -159,33 +216,15 @@ def stage_seam(c, j, pre):
         # the custom all-reduce's bf16 result
         x0 = dead.select(zero, bf16_round(lo))
         x1 = dead.select(zero, bf16_round(hi))
-        p = wave_sum(x0 * x0 + x1 * x1)
-        if lane == 0:
-            c["put"](scr["ass"], ss_pair(j, t), p)
-        tot = _slices_total(c, scr["ass"], t)
-        r = hw_rsq(tot * fx.Float32(INV_H) + fx.Float32(POST_ATTN_EPS))
-        s0, s1 = pre["s"]
-        a0, a1 = pre["alpha"]
-        b0, b1 = pre["beta"]
-        n0 = dead.select(zero, a0 * s0 + b0 * (x0 * r))
-        n1 = dead.select(zero, a1 * s1 + b1 * (x1 * r))
-        bo.buffer_store(
-            fx.Vector.from_elements([n0, n1], fx.Float32),
-            rsrc(a["stream_out"]),
-            t * HIDDEN + col,
-        )
-        q = wave_sum(n0 * n0 + n1 * n1)
-        if lane == 0:
-            c["put"](scr["bss"], ss_pair(j, t), q)
-        tot2 = _slices_total(c, scr["bss"], t)
-        r2 = hw_rsq(tot2 * fx.Float32(INV_H) + fx.Float32(PRE_FFN_EPS))
-        w0, w1 = pre["w"]
-        f0 = dead.select(zero, (n0 * r2) * w0)
-        f1 = dead.select(zero, (n1 * r2) * w1)
-        bo.buffer_store(
-            bf16_pair(f0, f1),
-            rsrc(scr["xrow"]),
-            xrow_elem(t, col) // 2,
-            cache_modifier=CM_DEV,
+        blend_norm(
+            c,
+            j,
+            pre,
+            x0,
+            x1,
+            (scr["ass"], scr["bss"]),
+            POST_ATTN_EPS,
+            PRE_FFN_EPS,
+            (a["stream_out"], scr["xrow"], xrow_elem),
         )
     publish(c["put"], scr["xrdy"], xrdy_pair(j), fx.Int32(1), tid == 0)

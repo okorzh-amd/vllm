@@ -10,6 +10,14 @@ VGPR and LDS budget; the routing sigmoid lowers to an IEEE divide.
 [1GPU] The probes run: put / poll round trips in both scopes, the peer parity,
 LDS stage structs and composites, the route table encoding, ``ld_pad``, and a
 wait that gives up after its ``WAIT_BUDGET`` and fails the rank.
+
+Phases B and C (DESIGN_BC 10.1, WP-B1): K1's context (``peers=False``,
+``route_lds=False``, a ``K1Build`` key) and the Phase B / C scratch regions
+in ``c["scr"]``; the stock-order reductions ``ops.seq8_sum`` (the fused
+QK-norm insert's, 1.3) and ``ops.tl_sum64`` (Triton's gated norm, 1.4) and the
+raw ``ops.hw_sqrt``. [CPU] their ISA (no fma in the serial chain nor in the
+gate's butterfly, a raw ``v_sqrt_f32``); [1GPU] ``torch.equal`` with the stock kernels
+on 1e5 rows and with an fp32 emulation of their order.
 """
 
 import glob
@@ -26,8 +34,12 @@ pytest.importorskip("aiter")
 import flydsl.expr as fx  # noqa: E402
 from aiter.ops.flydsl.kernels import buffer_ops as bo  # noqa: E402
 from flydsl.expr import gpu, range_constexpr  # noqa: E402
+from flydsl.expr import math as fmath  # noqa: E402
 from flydsl.expr.typing import T  # noqa: E402
 
+from tests.models.muse_spark.amd_specialized_decode import (  # noqa: E402
+    reference,
+)
 from vllm.models.muse_spark.amd.specialized_decode.mono import spec  # noqa: E402
 from vllm.models.muse_spark.amd.specialized_decode.mono.abi import (  # noqa: E402
     FAILED,
@@ -49,20 +61,35 @@ from vllm.models.muse_spark.amd.specialized_decode.mono.common.mx import (  # no
     w13_scale_word,
 )
 from vllm.models.muse_spark.amd.specialized_decode.mono.common.ops import (  # noqa: E402
+    CM_DEV,
+    bf16_round,
+    bf_hi,
+    bf_lo,
     block_excl_scan,
+    hw_rsq,
     hw_sigmoid_approx,
+    hw_sqrt,
     ieee_sigmoid,
+    ld_dev,
+    ld_i32,
     ld_pad,
     row_sum,
     rsrc,
+    seq8_sum,
+    tl_sum64,
     traced,
     wave_sum,
+)
+from vllm.models.muse_spark.amd.specialized_decode.mono.common.plan import (  # noqa: E402
+    Space,
 )
 from vllm.models.muse_spark.amd.specialized_decode.mono.common.ranks import (  # noqa: E402
     peer_at,
 )
 from vllm.models.muse_spark.amd.specialized_decode.mono.common.sync import (  # noqa: E402
+    Addr,
     publish,
+    uniform_addr,
 )
 from vllm.models.muse_spark.amd.specialized_decode.mono.stages import (  # noqa: E402
     gemv,
@@ -315,6 +342,177 @@ def _probes(S: int = 2):
     }
 
 
+# ---------------------------------------------------------------- B / C probes
+
+ROW_PROBE_ROWS = spec.BLOCKS * spec.WAVES  # a row of 64 a wave
+LAY = spec.scratch_layout()
+# the Phase B / C mailbox regions' last pair, the plain regions' last word
+BC_LAST_PAIR = tuple(LAY[r][1] // 8 - 1 for r in spec.SCRATCH_REGIONS_BC)
+BC_PLAIN = tuple(n for n, _, _ in spec.SCRATCH_PLAIN_BC)
+BC_LAST_WORD = tuple(LAY[r][1] // 4 - 1 for r in BC_PLAIN)
+K1_KEY = spec.K1Build(tokens=2, rope=False)
+K1_FAULT_KEY = spec.K1Build(
+    tokens=2,
+    rope=True,
+    fault_rank=1,
+    fault_epoch=3,
+    fault_slot=spec.k1_slot(2),
+    fault_ticks=1000,
+)
+
+
+def _bf16_at(ptr, i):
+    """bf16 element i of a buffer, as an f32."""
+    w = ld_i32(ptr, i // 2)
+    return fx.Float32((i % 2 == 1).select(bf_hi(w), bf_lo(w)))
+
+
+@traced
+def _k1_exchanges(c):
+    """K1's context: a device-scope hand-off over ``fss``, a plain ``arow``
+    row (CM_DEV) published by an ``ardy`` flag, every Phase B / C region's
+    last pair and plain word through ``c["scr"]``, the context scalars."""
+    tid, scr = c["tid"], c["scr"]
+    out = c["args"]["out"]
+    if tid < 64:
+        c["put"](scr["fss"], tid, tid * 3 + 1)
+    if tid < 64:
+        v = c["poll"]([(uniform_addr(scr["fss"]), (tid + 1) % 64, 1)])[0][0]
+        _st(out, tid, v)
+    if tid < 64:
+        bo.buffer_store(
+            fx.Int32(tid + 40), rsrc(scr["arow"]), tid, cache_modifier=CM_DEV
+        )
+    publish(c["put"], scr["ardy"], 5, 1, tid == 0)
+    if tid < 64:
+        f = c["poll"]([(uniform_addr(scr["ardy"]), 5, 1)])[0][0]
+        _st(out, 64 + tid, f + fx.Int32(ld_dev(scr["arow"], (tid + 1) % 64)))
+    if tid == 0:
+        for i in range_constexpr(len(BC_LAST_PAIR)):
+            c["put"](scr[spec.SCRATCH_REGIONS_BC[i]], BC_LAST_PAIR[i], 1000 + i)
+        for i in range_constexpr(len(BC_PLAIN)):
+            bo.buffer_store(
+                fx.Int32(2000 + i),
+                rsrc(scr[BC_PLAIN[i]]),
+                BC_LAST_WORD[i],
+                cache_modifier=CM_DEV,
+            )
+        _st(out, 128, c["e"])
+        _st(out, 129, c["par"])
+        _st(out, 130, c["slot"])
+        _st(out, 131, c["rank"])
+        _st(out, 132, c["S"])
+    # the stage union (no RouteLds before it); ``out`` re-read from lane 0:
+    # its buffer resource would otherwise merge with the tid == 0 stores' at
+    # the join and the store become a readfirstlane waterfall
+    one = c["lds"]["one"]
+    fx.ptr_store(tid * 7, one["v"] + tid)
+    gpu.barrier()
+    out = uniform_addr(Addr("out", Space.SCRATCH, out)).value
+    _st(out, 256 + tid, fx.ptr_load(one["v"] + (tid + 1) % THREADS))
+    gpu.barrier()
+
+
+def _k1_context(c):
+    """``_k1_exchanges`` in a context with no peer regions and no route table
+    (checked while tracing)."""
+    if c["peer"] or c["rt"]:
+        raise AssertionError(f"K1 context: peer {list(c['peer'])} rt {list(c['rt'])}")
+    if c["key"] is None or not isinstance(c["key"], spec.K1Build):
+        raise AssertionError(f"K1 context key {c['key']!r}")
+    _k1_exchanges(c)
+
+
+@traced
+def _sqrt(c):
+    """``hw_sqrt`` of word tid."""
+    a = c["args"]
+    x = fx.Float32(bo.buffer_load(rsrc(a["x"]), c["tid"], vec_width=1, dtype=T.f32))
+    _st(a["y"], c["tid"], hw_sqrt(x))
+
+
+def _row(c):
+    """(row, lane, x): wave w of CTA b takes row 8 b + w of ``x`` (bf16 [2048,
+    64]), lane d its dim d."""
+    r = c["bid"] * spec.WAVES + c["wave"]
+    return r, c["lane"], _bf16_at(c["args"]["x"], r * 64 + c["lane"])
+
+
+@traced
+def _seq8(c):
+    """``seq8_sum`` of each row's rounded squares -> ``tot`` word r."""
+    r, lane, x = _row(c)
+    tot = seq8_sum(x * x, lane)
+    if lane == 0:
+        _st(c["args"]["tot"], r, tot)
+
+
+@traced
+def _qknorm(c):
+    """The fused insert's QK-norm (DESIGN_BC 1.3 steps 1-5, 7; NoPE) of each
+    row: ``tot`` word r and y = bf16(RN(x rsq(fma(tot, 2^-6, eps)))) as f32."""
+    a = c["args"]
+    r, lane, x = _row(c)
+    tot = seq8_sum(x * x, lane)
+    q = fx.Float32(fmath.fma(tot, fx.Float32(2.0**-6), fx.Float32(spec.RMS_EPS)))
+    _st(a["y"], r * 64 + lane, bf16_round(x * hw_rsq(q)))
+    if lane == 0:
+        _st(a["tot"], r, tot)
+
+
+@traced
+def _tl64(c):
+    """``tl_sum64`` of each row -> ``tot`` word r."""
+    r, lane, x = _row(c)
+    tot = tl_sum64(x, lane)
+    if lane == 0:
+        _st(c["args"]["tot"], r, tot)
+
+
+@traced
+def _gate(c):
+    """FLA's gated norm (DESIGN_BC 1.4) of each row with gate row ``g``:
+    ``tot`` word r and y = bf16(RN(RN(x rstd) sigmoid(g))) as f32, rstd = 1 /
+    sqrt(fma(tot, 2^-6, eps)) with the raw sqrt and an IEEE divide."""
+    a = c["args"]
+    r, lane, x = _row(c)
+    g = _bf16_at(a["g"], r * 64 + lane)
+    tot = tl_sum64(x, lane)
+    q = fx.Float32(fmath.fma(tot, fx.Float32(2.0**-6), fx.Float32(spec.RMS_EPS)))
+    rstd = fx.Float32(1.0) / hw_sqrt(q)
+    _st(a["y"], r * 64 + lane, bf16_round((x * rstd) * ieee_sigmoid(g)))
+    if lane == 0:
+        _st(a["tot"], r, tot)
+
+
+def _b1_probes():
+    rows = dict(blocks=spec.BLOCKS)
+    k1 = dict(peers=False, route_lds=False)
+    return {
+        "k1ctx": context.probe_kernel(
+            "muse_probe_k1ctx", 2, _k1_context, {"one": OneLds}, ("out",),
+            build=K1_KEY, **k1,
+        ),
+        "k1ctx_fault": context.probe_kernel(
+            "muse_probe_k1ctx_fault", 2, _k1_context, {"one": OneLds}, ("out",),
+            build=K1_FAULT_KEY, **k1,
+        ),
+        "sqrt": context.probe_kernel("muse_probe_sqrt", 1, _sqrt, None, ("x", "y")),
+        "seq8": context.probe_kernel(
+            "muse_probe_seq8", 1, _seq8, None, ("x", "tot"), **rows
+        ),
+        "qknorm": context.probe_kernel(
+            "muse_probe_qknorm", 1, _qknorm, None, ("x", "y", "tot"), **rows
+        ),
+        "tl64": context.probe_kernel(
+            "muse_probe_tl64", 1, _tl64, None, ("x", "tot"), **rows
+        ),
+        "gate": context.probe_kernel(
+            "muse_probe_gate", 1, _gate, None, ("x", "g", "y", "tot"), **rows
+        ),
+    }  # fmt: skip
+
+
 # ---------------------------------------------------------------- [CPU]
 
 
@@ -558,6 +756,129 @@ def test_probe_compiles(which, tmp_path, monkeypatch):
         assert "v_cvt_scalef32_pk_fp4_bf16" in txt
 
 
+def test_context_without_peers_or_route_lds():
+    """K1's context (DESIGN_BC 5.2): no ``peers`` argument and no route table
+    in LDS; K2's context unchanged."""
+    assert set(context.CONTEXT_ARGS) <= set(spec.K2_ARGS)
+    assert set(context.LOCAL_CONTEXT_ARGS) <= set(spec.K1_ARGS)
+    assert "peers" not in spec.K1_ARGS
+    local = tuple(n for n in context.CONTEXT_ARGS if n != "peers")
+    assert local == context.LOCAL_CONTEXT_ARGS
+    assert context.lds_total_bytes(route_lds=False) == 8192
+    assert context.lds_total_bytes(LDS, route_lds=False) == 8192 + THREADS * 4
+    assert context.lds_total_bytes(LDS) == 8192 + 3904 + THREADS * 4
+    # the argument checks run before anything is traced
+    args = {n: 0 for n in context.LOCAL_CONTEXT_ARGS}
+    with pytest.raises(KeyError, match="peers"):
+        context.make_context(1, args)
+    with pytest.raises(KeyError, match="rank"):
+        context.make_context(1, {n: 0 for n in args if n != "rank"}, peers=False)
+    with pytest.raises(ValueError, match="peers_alias"):
+        context.make_context(1, args, peers=False, peers_alias=True)
+
+    # LDS that fits only without RouteLds
+    @fx.struct
+    class Big:
+        z: fx.Array[fx.Int32, (spec.LDS_BYTES - 8192) // 4, 16]
+
+    assert context.lds_total_bytes({"big": Big}, route_lds=False) == spec.LDS_BYTES
+    with pytest.raises(ValueError, match="LDS"):
+        context.make_context(1, args, {"big": Big}, peers=False)
+    with pytest.raises(ValueError, match="LDS"):
+        context.probe_kernel("p_big", 1, _timeout, {"big": Big}, ("out",))
+    context.probe_kernel(
+        "p_big", 1, _timeout, {"big": Big}, ("out",), peers=False, route_lds=False
+    )
+
+
+def test_probe_key_covers_the_context():
+    """``peers``, ``route_lds`` and the build key are part of a probe's key;
+    without peers ``peers_alias`` does not apply."""
+    p = _b1_probes()
+    assert _b1_probes()["k1ctx"] is p["k1ctx"]
+    a = context.probe_kernel("p_ctx", 1, _timeout, None, ("out",))
+    b = context.probe_kernel("p_ctx", 1, _timeout, None, ("out",), peers=False)
+    c = context.probe_kernel("p_ctx", 1, _timeout, None, ("out",), route_lds=False)
+    d = context.probe_kernel("p_ctx", 1, _timeout, None, ("out",), build=K1_KEY)
+    assert len({id(x) for x in (a, b, c, d)}) == 4
+    e = context.probe_kernel(
+        "p_ctx", 1, _timeout, None, ("out",), peers=False, peers_alias=False
+    )
+    assert e is b
+
+
+# readfirstlane waterfall around a load whose base is not wave-uniform
+_WATERFALL = re.compile(r"v_cmp_eq_u64_e\d+\s+\S+,\s*s\[\d+:\d+\],\s*v\[")
+
+
+def _fma_ops(txt: str) -> list[str]:
+    """The fused multiply-adds of a final ISA (every encoding)."""
+    return re.findall(r"^\s*(v_(?:pk_)?fma\w*|v_fmac\w*|v_mad\w*|v_mac\w*)", txt, re.M)
+
+
+@compiles
+@pytest.mark.parametrize(
+    "which", ["k1ctx", "k1ctx_fault", "sqrt", "seq8", "qknorm", "tl64", "gate"]
+)
+def test_b1_probe_compiles(which, tmp_path, monkeypatch):
+    """The compile gate on the B1 probes, and the ISA the stock orders need:
+    ``seq8_sum``'s serial chain and tree contract nothing into an fma (the
+    .cu's adds are separate, 1.3 step 2); ``tl_sum64`` has no fma (the
+    served leaf is a multiply and an add) and the xor 1, 32, 16, 8, 4, 2
+    butterfly (permlane swaps and DPP); ``hw_sqrt`` is a bare
+    ``v_sqrt_f32`` (no 2^32 range scaling, no correction)."""
+    monkeypatch.setenv("FLYDSL_RUNTIME_ENABLE_CACHE", "0")
+    monkeypatch.setenv("FLYDSL_DUMP_IR", "1")
+    monkeypatch.setenv("FLYDSL_DUMP_DIR", str(tmp_path))
+    probe = _b1_probes()[which]
+    try:
+        probe.compile()
+    except RuntimeError as e:  # the load, past the compile, needs a device
+        if "hipErrorNoDevice" not in str(e) and "no ROCm" not in str(e):
+            raise
+    txt, res = _isa(str(tmp_path), probe.name)
+    print(f"{probe.name}: {res}")
+    assert res["private_segment_fixed_size"] == 0, res
+    assert res["next_free_vgpr"] <= spec.VGPR_MAX, res
+    assert res["group_segment_fixed_size"] <= spec.LDS_BYTES, res
+    loops = _WATERFALL.findall(txt)
+    assert not loops, f"{len(loops)} waterfall compares, e.g. {loops[0]}"
+    fmas = _fma_ops(txt)
+    shr = {k: len(re.findall(rf"row_shr:{k}\b", txt)) for k in (1, 2, 4, 8)}
+    if which.startswith("k1ctx"):
+        # the stage union only: no RouteLds field, no fixed red (unused)
+        assert res["group_segment_fixed_size"] == THREADS * 4, res
+        # the fault prologue (sync.stall's s_sleep 127) only in the fault build
+        assert ("s_sleep 0x7f" in txt or "s_sleep 127" in txt) == (
+            which == "k1ctx_fault"
+        )
+    if which == "sqrt":
+        assert txt.count("v_sqrt_f32") == 1, txt.count("v_sqrt_f32")
+        assert "0x4f800000" not in txt and "0xf800000" not in txt
+        assert "v_rsq_f32" not in txt and not fmas, fmas
+    if which in ("seq8", "qknorm"):
+        assert shr[1] >= 7, shr
+        assert len(re.findall(r"^\s*v_add_f32", txt, re.M)) >= 10
+    if which == "seq8":
+        assert not fmas, fmas
+        assert len(re.findall(r"^\s*v_mul_f32", txt, re.M)) >= 1
+    if which == "qknorm":
+        # the one fma is fma(tot, 2^-6, eps) (v_fmamk / v_fmaak: the
+        # constants inline); the rsq is the hardware one
+        assert len(fmas) == 1 and "v_rsq_f32" in txt, fmas
+    if which in ("tl64", "gate"):
+        # the served gate's butterfly: lanes ^ 1 (the leaf), 32, 16, 8, 4, 2
+        assert "v_permlane32_swap" in txt and "v_permlane16_swap" in txt
+        assert shr[8] >= 1 and shr[4] >= 1, shr
+    if which == "tl64":
+        # the leaf is RN(x^2) + RN(x'^2): no fma (stock: v_pk_mul + v_add)
+        assert not fmas, fmas
+    if which == "gate":
+        # a_j and the sqrt argument, plus the IEEE divides' fma sequences
+        assert "v_sqrt_f32" in txt and "v_div_fixup_f32" in txt
+        assert "v_rsq_f32" not in txt and "0x4f800000" not in txt
+
+
 # ---------------------------------------------------------------- [1GPU]
 
 
@@ -741,3 +1062,239 @@ def test_helpers_probe():
     st, rg = cc // 4, (r % 1024) // 16
     byte = (o[2124:2636] >> ((st % 2) * 16 + (rg % 2) * 8)) & 0xFF
     assert torch.equal(byte, codes[r, cc].int())
+
+
+# ---------------------------------------------------------------- B / C stock orders
+
+N_ROWS = 100_000  # DESIGN_BC 10.1: the B1 helpers on 1e5 rows
+
+
+def _f32(v: float) -> torch.Tensor:
+    return torch.tensor(v, dtype=torch.float32)
+
+
+def _tl_sum64_ref(x: torch.Tensor) -> torch.Tensor:
+    """``tl_sum64``'s order in fp32 (correctly rounded on the CPU): the
+    served gfx950 ``rms_norm_gated`` tree, ``reference.gated_sumsq`` (leaf
+    RN(x_2c^2) + RN(x_2c+1^2), then halving 16, 8, 4, 2, 1)."""
+    return reference.gated_sumsq(x)
+
+
+def _seq8_sum_ref(x: torch.Tensor) -> torch.Tensor:
+    """``seq8_sum``'s order in fp32: per 8-dim chunk the serial sum of the
+    rounded squares, the chunks as ((s0 + s4) + (s2 + s6)) + ((s1 + s5) +
+    (s3 + s7))."""
+    sq = x.float().reshape(-1, 8, 8) ** 2
+    s = sq[..., 0]
+    for k in range(1, 8):
+        s = s + sq[..., k]
+    return ((s[:, 0] + s[:, 4]) + (s[:, 2] + s[:, 6])) + (
+        (s[:, 1] + s[:, 5]) + (s[:, 3] + s[:, 7])
+    )
+
+
+def _rows(n: int, seed: int) -> torch.Tensor:
+    """N bf16 rows of 64 (CPU): normal rows over five decades of scale, and
+    rows that make the edges bite: eps-scale (|x| ~ 3e-3: var ~ eps), all
+    zero, one huge element, alternating signs, exactly representable sums."""
+    g = torch.Generator().manual_seed(seed)
+    scale = torch.exp2(torch.randint(-8, 9, (n, 1), generator=g).float())
+    x = torch.randn(n, 64, generator=g) * scale
+    x[0::97] *= 3e-3 / scale[0::97]
+    x[1::997] = 0
+    x[2::991, 5] = 3e4
+    x[3::983] = torch.tensor([1.0, -1.0] * 32)
+    return x.to(torch.bfloat16)
+
+
+def _run_rows(probe, bufs, n: int, **arrays):
+    """Launch a row probe over n rows, 2048 a launch: every array is [n_pad,
+    ...] and is sliced per launch (the probe's row r is the slice's)."""
+    for r0 in range(0, n, ROW_PROBE_ROWS):
+        probe(bufs, **{k: v[r0 : r0 + ROW_PROBE_ROWS] for k, v in arrays.items()})
+    torch.accelerator.synchronize()
+    assert not bufs.failed(), bufs.given_up_waits()
+
+
+def _padded(x: torch.Tensor) -> torch.Tensor:
+    n = -(-x.shape[0] // ROW_PROBE_ROWS) * ROW_PROBE_ROWS
+    out = torch.zeros((n, *x.shape[1:]), dtype=x.dtype)
+    out[: x.shape[0]] = x
+    return out.cuda()
+
+
+def test_stock_order_emulations_match_the_references():
+    """[CPU] The probes' host emulations of the two stock orders are B0's
+    reviewed references, bit for bit: ``_seq8_sum_ref`` -> the NoPE QK-norm
+    of ``reference.qk_norm_rope``, ``_tl_sum64_ref`` -> ``reference.gated_norm``."""
+    x = _rows(8192, 23)
+    og = (torch.randn(8192, 64, generator=torch.Generator().manual_seed(24)) * 30).to(
+        torch.bfloat16
+    )
+    eps, m = _f32(spec.RMS_EPS), _f32(2.0**-6)
+    r = torch.rsqrt(_seq8_sum_ref(x) * m + eps)
+    norm = (x.float() * r[:, None]).to(torch.bfloat16)
+    assert torch.equal(norm, reference.qk_norm_rope(x, None))
+    rstd = _f32(1.0) / torch.sqrt(_tl_sum64_ref(x) * m + eps)
+    y = (x.float() * rstd[:, None]) * reference.sigmoid(og)
+    assert torch.equal(y.to(torch.bfloat16), reference.gated_norm(x, og))
+
+
+@needs_gfx950
+def test_k1_context_probe():
+    """K1's context runs: the fss hand-off, the arow row behind its ardy flag,
+    every Phase B / C region where ``spec.scratch_layout`` puts it, tags of a
+    K1 slot."""
+    probe = _b1_probes()["k1ctx"]
+    bufs = context.ProbeBuffers(epoch=9, rank=5, slot=spec.k1_slot(3))
+    tag = bufs.tag()
+    out = torch.zeros(OUT_WORDS, dtype=torch.int32, device="cuda")
+    probe(bufs, out=out)
+    torch.accelerator.synchronize()
+    assert not bufs.failed(), bufs.given_up_waits()
+    o = out.cpu()
+    t = torch.arange(64)
+    assert torch.equal(o[:64], (t + 1) % 64 * 3 + 1)
+    assert torch.equal(o[64:128], 1 + (t + 1) % 64 + 40)
+    assert o[128:133].tolist() == [9, 1, spec.k1_slot(3), 5, 2]
+    vals, tags = bufs.read_pairs("fss", 0, 64)
+    assert torch.equal(vals.cpu(), t * 3 + 1) and (tags == tag).all()
+    for i, r in enumerate(spec.SCRATCH_REGIONS_BC):
+        vals, tags = bufs.read_pairs(r, BC_LAST_PAIR[i], 1)
+        assert (vals.item(), tags.item()) == (1000 + i, tag), r
+    for i, r in enumerate(BC_PLAIN):
+        off, nbytes = LAY[r]
+        word = bufs.scratch[off + nbytes - 4 : off + nbytes].view(torch.int32)
+        assert word.item() == 2000 + i, r
+    arow = LAY[spec.AROW][0]
+    got = bufs.scratch[arow : arow + 256].view(torch.int32).cpu()
+    assert torch.equal(got, t + 40)
+    tt = torch.arange(THREADS)
+    assert torch.equal(o[256 : 256 + THREADS], (tt + 1) % THREADS * 7)
+    # nothing outside the scratch's regions moved: the peer buffer is untouched
+    assert not bufs.peer.any()
+
+
+@needs_gfx950
+def test_hw_sqrt_probe():
+    """``hw_sqrt`` is v_sqrt_f32: within 1 ulp of the exact root over the
+    normal range, exact on perfect squares, sqrt(+-0) = +-0, sqrt(inf) = inf,
+    NaN below 0."""
+    probe = _b1_probes()["sqrt"]
+    bufs = context.ProbeBuffers()
+    g = torch.Generator().manual_seed(3)
+    x = torch.exp2(torch.empty(THREADS).uniform_(-120, 120, generator=g))
+    x[:8] = torch.tensor([0.0, -0.0, float("inf"), -1.0, 4.0, 2.25, 1e-30, 9.0])
+    y = torch.zeros(THREADS, dtype=torch.float32, device="cuda")
+    probe(bufs, x=x.cuda(), y=y)
+    torch.accelerator.synchronize()
+    y = y.cpu()
+    assert y[0].item() == 0.0 and y[1].item() == 0.0 and torch.signbit(y[1])
+    assert y[2].item() == float("inf") and y[3].isnan()
+    assert y[4].item() == 2.0 and y[5].item() == 1.5 and y[7].item() == 3.0
+    exact = x[6:].double().sqrt()
+    ulp = torch.finfo(torch.float32).eps * exact
+    assert ((y[6:].double() - exact).abs() <= ulp).all()
+
+
+@needs_gfx950
+def test_seq8_sum_matches_the_fused_insert():
+    """``seq8_sum`` (and the QK-norm built on it) on 1e5 heads: the sum equals
+    the fp32 emulation of the .cu's order bit for bit, and the normalized
+    head equals the stock ``fused_muse_spark_qknorm_rope_kv_insert`` (NoPE,
+    HEADS_PER_GROUP 1) bit for bit."""
+    from vllm import _custom_ops as ops
+
+    probe = _b1_probes()["qknorm"]
+    bufs = context.ProbeBuffers()
+    x = _rows(N_ROWS, 20)
+    xs = _padded(x)
+    y = torch.zeros(xs.shape, dtype=torch.float32, device="cuda")
+    tot = torch.zeros(xs.shape[0], dtype=torch.float32, device="cuda")
+    _run_rows(probe, bufs, N_ROWS, x=xs, y=y, tot=tot)
+    assert torch.equal(tot[:N_ROWS].cpu(), _seq8_sum_ref(x))
+    got = y[:N_ROWS].to(torch.bfloat16).cpu()
+    # the stock op on the same heads: 18 normalized heads a token (q and k),
+    # 1024 tokens a call (HEADS_PER_GROUP 1 at NoPE below 2048), no insert
+    nh = spec.HEADS + spec.KV_HEADS
+    S = 1024
+    tokens = -(-N_ROWS // nh)
+    heads = torch.zeros(tokens * nh, 64, dtype=torch.bfloat16)
+    heads[:N_ROWS] = x
+    kv = torch.zeros(
+        4, spec.KV_HEADS, spec.KV_BLOCK, spec.KV_C, dtype=torch.bfloat16, device="cuda"
+    )
+    stock = []
+    for t0 in range(0, tokens, S):
+        n = min(S, tokens - t0)
+        qkv = torch.zeros(n, spec.QKV_ROWS, dtype=torch.bfloat16)
+        qkv[:, : spec.ROW_V] = heads[t0 * nh : (t0 + n) * nh].reshape(n, -1)
+        qkv = qkv.cuda()
+        ops.fused_muse_spark_qknorm_rope_kv_insert(
+            qkv,
+            torch.zeros(n, dtype=torch.int64, device="cuda"),
+            spec.HEADS,
+            spec.KV_HEADS,
+            spec.HEAD_DIM,
+            spec.RMS_EPS,
+            None,
+            0,
+            torch.full((n,), -1, dtype=torch.int64, device="cuda"),
+            kv,
+            spec.KV_BLOCK,
+        )
+        stock.append(qkv[:, : spec.ROW_V].reshape(-1, 64).cpu())
+    stock = torch.cat(stock)[:N_ROWS]
+    assert not kv.any()  # slot -1: no insert
+    same = (got == stock).all(1)
+    assert same.all(), (
+        f"{(~same).sum().item()} heads differ, e.g. {(~same).nonzero()[:4]}"
+    )
+
+
+@needs_gfx950
+def test_tl_sum64_matches_the_gated_norm():
+    """``tl_sum64`` (and the gate built on it with ``hw_sqrt``) on 1e5 rows:
+    the sum equals the fp32 emulation of Triton's gfx950 tree bit for bit, and
+    the gated row equals the runtime-compiled FLA ``rms_norm_gated`` (o_gate
+    read at the served stride 2304) ``torch.equal``; gate values cover
+    sigmoid's saturation (+-88, +-100)."""
+    from vllm.third_party.flash_linear_attention.ops.kda import (
+        rms_norm_gated,
+    )
+
+    probe = _b1_probes()["gate"]
+    bufs = context.ProbeBuffers()
+    x = _rows(N_ROWS, 21)
+    tokens = -(-N_ROWS // spec.HEADS)
+    g = torch.Generator().manual_seed(22)
+    qkvo = (torch.randn(tokens, spec.QKV_ROWS, generator=g) * 4).to(torch.bfloat16)
+    # og rows (token, head) as a copy: the og columns have the row stride
+    # 2304, so no [rows, 64] view of them exists; the edits go back below
+    og = qkvo[:, spec.ROW_G :].reshape(-1, 64)
+    og[0::89] = torch.tensor([-100.0, -88.0, 0.0, 88.0, 100.0] * 12 + [0.0] * 4).to(
+        torch.bfloat16
+    )
+    qkvo[:, spec.ROW_G :] = og.view(tokens, -1)
+    attn = torch.zeros(tokens * spec.HEADS, 64, dtype=torch.bfloat16)
+    attn[:N_ROWS] = x
+    xs, gs = _padded(attn[:N_ROWS]), _padded(og[:N_ROWS])
+    y = torch.zeros(xs.shape, dtype=torch.float32, device="cuda")
+    tot = torch.zeros(xs.shape[0], dtype=torch.float32, device="cuda")
+    _run_rows(probe, bufs, N_ROWS, x=xs, g=gs, y=y, tot=tot)
+    assert torch.equal(tot[:N_ROWS].cpu(), _tl_sum64_ref(x))
+    got = y[:N_ROWS].to(torch.bfloat16).cpu()
+    qkvo_d = qkvo.cuda()
+    stock = rms_norm_gated(
+        attn.cuda().view(tokens, spec.HEADS, 64),
+        qkvo_d[:, spec.ROW_G :].reshape(tokens, spec.HEADS, 64),
+        None,
+        None,
+        "sigmoid",
+        eps=spec.RMS_EPS,
+    )
+    stock = stock.reshape(-1, 64)[:N_ROWS].cpu()
+    same = (got == stock).all(1)
+    assert same.all(), (
+        f"{(~same).sum().item()} rows differ, e.g. {(~same).nonzero()[:4]}"
+    )

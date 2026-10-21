@@ -579,6 +579,19 @@ class MuseSpark1xAttention(nn.Module):
             self.attn_temperature_tuning_q_scale,
         )
 
+    def _split_qkv(
+        self, qkv: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
+        """Views ``(q, k, v, o_gate)`` of a qkv block (o_gate None without one)."""
+        if self.use_o_gate:
+            q, k, v, og = qkv.split(
+                [self.q_size, self.kv_size, self.kv_size, self.q_size], dim=-1
+            )
+        else:
+            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+            og = None
+        return q, k, v, og
+
     def _qk_norm_rope_kv_insert(
         self, qkv: torch.Tensor, positions: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
@@ -603,13 +616,7 @@ class MuseSpark1xAttention(nn.Module):
                 self.rms_norm_eps,
             )
 
-        if self.use_o_gate:
-            q, k, v, og = qkv.split(
-                [self.q_size, self.kv_size, self.kv_size, self.q_size], dim=-1
-            )
-        else:
-            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-            og = None
+        q, k, v, og = self._split_qkv(qkv)
         if self.fused_qk_norm_rope_kv_insert:
             return q, k, v, og
 
@@ -631,26 +638,34 @@ class MuseSpark1xAttention(nn.Module):
             q, k = self.rotary_emb.forward_cuda(positions, q, k)
         return q, k, v, og
 
-    def forward(
-        self,
-        positions: torch.Tensor,
-        hidden_states: torch.Tensor,
-        skip_o_proj: bool = False,
+    def front(
+        self, positions: torch.Tensor, hidden_states: torch.Tensor
     ) -> torch.Tensor:
-        """Attention over an input the caller has already normalized. With
-        ``skip_o_proj`` (the specialized decode) it returns o_proj's input, the
-        gated core [T, num_heads * head_dim]: the decode kernel runs o_proj and
-        its all-reduce."""
+        """qkv_proj, then the fused QK-norm / RoPE / KV insert in place (the fused
+        path only): the qkv block [T, q | k | v | o_gate] with q and k normalized
+        and rotated and this step's K / V in the cache. The specialized decode
+        runs it, then ``attend`` or its own attention core."""
+        assert self.fused_qk_norm_rope_kv_insert
         qkv, _ = self.qkv_proj(hidden_states)
+        self._qk_norm_rope_kv_insert(qkv, positions)
+        return qkv
 
-        q, k, v, og = self._qk_norm_rope_kv_insert(qkv, positions)
-
+    def attend(self, qkv: torch.Tensor, gate: bool = True) -> torch.Tensor:
+        """The attention over a ``front`` block: o_proj's input, the gated core
+        (``gate``), or the attention output before the output norm and o_gate
+        [T, num_heads * head_dim] (the specialized decode applies them)."""
+        assert self.fused_qk_norm_rope_kv_insert
+        q, _, _, og = self._split_qkv(qkv)
         # Withhold k/v so the attention layer does not rewrite the KV cache.
-        if self.fused_qk_norm_rope_kv_insert:
-            attn_output = self.attn(q, None, None)
-        else:
-            attn_output = self.attn(q, k, v)
+        attn_output = self.attn(q, None, None)
+        if gate:
+            attn_output = self._o_norm_gate(attn_output, og)
+        return attn_output.view(-1, self.num_heads * self.head_dim)
 
+    def _o_norm_gate(
+        self, attn_output: torch.Tensor, og: torch.Tensor | None
+    ) -> torch.Tensor:
+        """The output norm and o_gate, as configured."""
         if self.fuse_o_norm_gate:
             assert og is not None
             attn_output = attn_output.reshape(-1, self.num_heads, self.head_dim)
@@ -674,8 +689,25 @@ class MuseSpark1xAttention(nn.Module):
                 if attn_output.dim() == 2:
                     attn_output = attn_output.view(-1, self.num_heads, self.head_dim)
                 attn_output = og.sigmoid() * attn_output
+        return attn_output
 
-        attn_output = attn_output.view(-1, self.num_heads * self.head_dim)
+    def forward(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        skip_o_proj: bool = False,
+    ) -> torch.Tensor:
+        """Attention over an input the caller has already normalized. With
+        ``skip_o_proj`` (the specialized decode) it returns o_proj's input, the
+        gated core [T, num_heads * head_dim]: the decode kernel runs o_proj and
+        its all-reduce."""
+        if self.fused_qk_norm_rope_kv_insert:
+            attn_output = self.attend(self.front(positions, hidden_states))
+        else:
+            qkv, _ = self.qkv_proj(hidden_states)
+            q, k, v, og = self._qk_norm_rope_kv_insert(qkv, positions)
+            attn_output = self._o_norm_gate(self.attn(q, k, v), og)
+            attn_output = attn_output.view(-1, self.num_heads * self.head_dim)
         if skip_o_proj:
             return attn_output
         output, _ = self.o_proj(attn_output)

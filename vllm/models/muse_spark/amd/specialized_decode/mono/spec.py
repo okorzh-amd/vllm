@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """The contract every Muse Spark MonoKernel package shares: shapes, numerics,
-rows, grid, the K2 placement, mailbox slots, the build key, the argument list
-and the scratch / peer layouts.
+rows, grid, the K1 / K2 placements, mailbox slots, the build keys, the argument
+lists and the scratch / peer layouts.
 
 Pure Python (``dataclasses`` only): the runtime sizes its buffers and the CPU
 tests check the layouts without torch.cuda or FlyDSL. ``pair_layout`` is the
@@ -59,6 +59,19 @@ ROUTE_SCALE = 1.0
 ROUTE_EPS = 1e-15  # router_score_division_eps
 AMAX_FLOOR = 1e-10  # MXFP4 RoundUp: amax = max(amax, AMAX_FLOOR)
 LOG2E = 1.4426950408889634
+
+# Phases B and C (DESIGN_BC section 1.1): the attention front and core.
+RMS_EPS = 1e-5  # pre_qkv_proj_norm, the weightless qk_norm and o_norm
+POST_FFN_EPS = 1e-8  # the previous layer's post_ffn_norm (weight first)
+QK_SCALE_FACTOR = 5.4730064863875  # config.qk_scale_factor
+QK_SCALE = HEAD_DIM**-0.5 * QK_SCALE_FACTOR  # == float(impl.scale)
+QK_SCALE_LOG2E = QK_SCALE * LOG2E  # the split's base-2 logit scale (f32 in-kernel)
+ROPE_THETA = 5e5  # sliding layers' GPT-J RoPE over all 64 dims; full layers: NoPE
+WINDOW = 2048  # sliding layers attend keys L - WINDOW <= k < L
+KV_BLOCK = 16  # tokens a KV page (the kernel block)
+KV_C = 2 * HEAD_DIM  # a (block, head, token) row: K at [0, 64), V at [64, 128)
+V_OFF = HEAD_DIM  # V's element offset in the row
+Q_PER_KV = HEADS // KV_HEADS  # 8 query heads a KV head
 
 # --------------------------------------------------------------------------
 # Rows
@@ -121,6 +134,100 @@ ROUTE_LDS = dict(
 )
 
 # --------------------------------------------------------------------------
+# K1 placement (Phase B1; DESIGN_BC 5.1): weight-free boundary CTAs [0, NA),
+# the epilogue on CTAs [0, E_UNITS * S), the qkv GEMV on CTAs [NA, BLOCKS)
+
+QKV_ROWS = 2 * CORE + 2 * KV_HEADS * HEAD_DIM  # 2304 a rank: q | k | v | og
+QKV_TILES = QKV_ROWS // ROWS  # 144
+KPARTS = 16  # K parts of a qkv tile
+KPART = HIDDEN // KPARTS  # 512 columns: 4 chunks of 128, one a wave
+K1_TASKS = QKV_TILES * KPARTS  # 2304 (tile, K part) tasks: tau = 16 T + kp
+K1_GEMV0 = NA  # 64: the first GEMV CTA
+K1_GEMV_CTAS = BLOCKS - K1_GEMV0  # 192
+K1_TPC = K1_TASKS // K1_GEMV_CTAS  # 12 tasks a GEMV CTA: tau = 12 g + i
+K1_ROUNDS = K1_TPC // 2  # 6 rounds: waves 0-3 take task 2r, waves 4-7 2r + 1
+K1_MAXC = 2  # GEMV CTAs contributing to a tile (test_spec proves it)
+ROW_Q = 0  # the qkv row blocks: q heads, k heads, v heads, o_gate heads
+ROW_K = CORE
+ROW_V = ROW_K + KV_HEADS * HEAD_DIM
+ROW_G = ROW_V + KV_HEADS * HEAD_DIM
+E_UNITS = 5  # epilogue units a token: q 0-7, q 8-15, k + v, og 0-7, og 8-15
+
+
+def k1_contributor0(tile: int) -> int:
+    """The first of the ``K1_MAXC`` GEMV CTAs (g = b - K1_GEMV0) whose tasks
+    cover ``tile``: contributor c = g - k1_contributor0(tile) holds a run of the
+    tile's K parts, c = 0 the lower ones."""
+    return (KPARTS * tile) // K1_TPC
+
+
+def epilogue_row(unit: int, wave: int, lane: int) -> int | None:
+    """The qkv row epilogue CTA ``unit`` (token unit // E_UNITS) handles in
+    wave ``wave``, lane ``lane`` (= the head dim d), or None (an idle wave):
+    host mirror of DESIGN_BC 5.6's table."""
+    g5, d = unit % E_UNITS, lane
+    if g5 < 2:  # q heads 8 g5 + wave
+        return ROW_Q + 64 * (8 * g5 + wave) + d
+    if g5 == 2:  # k heads 0, 1 (waves 0, 1), v heads 0, 1 (waves 2, 3)
+        if wave >= 2 * KV_HEADS:
+            return None
+        base = ROW_K if wave < KV_HEADS else ROW_V
+        return base + 64 * (wave % KV_HEADS) + d
+    return ROW_G + 64 * (8 * (g5 - 3) + wave) + d  # og heads 8 (g5 - 3) + wave
+
+
+assert K1_TASKS == K1_TPC * K1_GEMV_CTAS and ROWS * QKV_TILES == QKV_ROWS
+assert ROW_G + CORE == QKV_ROWS and KPART * KPARTS == HIDDEN and KPART == 4 * COLS
+assert E_UNITS * MAX_ROWS <= NA and K1_ROUNDS * 2 == K1_TPC
+
+# --------------------------------------------------------------------------
+# K2 split-KV core placement (Phase C, q = 1 widths; DESIGN_BC 7.1). Split
+# unit u = (t * 2 + kvh) * N + p runs on CTA u; combine (t, h) on CTA
+# C0(S) + 16 t + h. A CTA holding both runs its unit first.
+
+NSPLIT_SW = 16  # sliding: <= 129 pages a window -> <= 9 a unit
+MIN_PER = 8  # pages a live unit at least: one a wave
+
+
+def nsplit(S: int, window: bool) -> int:
+    """N: units a (token, KV head)."""
+    return NSPLIT_SW if window else BLOCKS // (2 * S)
+
+
+def n_units(S: int, window: bool) -> int:
+    """Split units of a launch (CTAs [0, n_units))."""
+    return 2 * S * nsplit(S, window)
+
+
+def C0(S: int) -> int:
+    """The first combine CTA: [C0, BLOCKS) runs one (token, q head) each."""
+    return BLOCKS - 16 * S
+
+
+def split_unit(u: int, n: int) -> tuple[int, int, int]:
+    """Split unit u -> (token t, KV head kvh, part p)."""
+    return u // (2 * n), (u // n) % 2, u % n
+
+
+def split_plan(L: int, window: bool, n: int) -> tuple[int, int, int, int, int]:
+    """A (token, KV head)'s pages at context length L (already 0 for a pad
+    row and clamped to the table): (lo, b0, nb, per, live). Keys lo <= k < L;
+    pages b0 .. b0 + nb; unit p < live covers pages [b0 + p per, min(b0 + (p
+    + 1) per, b0 + nb)); units p >= live are empty."""
+    lo = max(0, L - WINDOW) if window else 0
+    b0 = lo // KV_BLOCK
+    nb = (L - 1) // KV_BLOCK - b0 + 1 if L > 0 else 0
+    per = max(-(-nb // n), MIN_PER)
+    return lo, b0, nb, per, -(-nb // per)
+
+
+assert all(
+    n_units(s, w) <= BLOCKS and C0(s) >= BLOCKS // 2
+    for s in range(1, MAX_ROWS + 1)
+    for w in (False, True)
+)
+
+# --------------------------------------------------------------------------
 # Mailbox tags: tag = (epoch & EPOCH_MASK) * TAG_SLOTS + slot + 1
 
 EPOCH_MASK = (1 << 22) - 1  # kernels use e & EPOCH_MASK: the int32 epoch may wrap
@@ -158,7 +265,53 @@ assert G_TASKS <= BLOCKS and MAX_U <= EXPERTS and TOPK <= 8
 assert step_tag(EPOCH_MASK, TAG_SLOTS - 1) < 2**31  # a tag is a positive int32
 
 # --------------------------------------------------------------------------
-# The build key and the argument list
+# The build keys and the argument lists
+
+K2_CORES = ("tensor", "gated", "split")  # K2Build.core
+_CORE_SUFFIX = {"tensor": "", "gated": "_g"}  # split: "_sw" / "_full"
+
+
+def _check_key(key, ints: tuple[str, ...], bools: tuple[str, ...], slots: range):
+    """The field checks K1Build and K2Build share: ``ints`` / ``bools`` typed,
+    the width in range, and the fault hook complete and able to fire in a
+    launch of a slot in ``slots``."""
+    cls = type(key).__name__
+    for f in ints:
+        v = getattr(key, f)
+        if type(v) is not int:  # bool too: it would name the symbol "sTrue"
+            raise TypeError(f"{cls}.{f} = {v!r}: an int")
+    for f in bools:
+        v = getattr(key, f)
+        if type(v) is not bool:
+            raise TypeError(f"{cls}.{f} = {v!r}: a bool")
+    if not 1 <= key.tokens <= MAX_ROWS:
+        raise ValueError(f"{cls}.tokens {key.tokens} (1 .. {MAX_ROWS})")
+    if not -1 <= key.fault_rank < TP:
+        raise ValueError(f"{cls}.fault_rank {key.fault_rank} (-1 .. {TP - 1})")
+    if not key.faulty:
+        # One build, one key: the fault fields of a build without the hook
+        # would key a second binary under the same kernel name.
+        if (key.fault_epoch, key.fault_slot, key.fault_ticks) != (0, 0, 0):
+            raise ValueError(f"{cls}.fault_* set without fault_rank")
+        return
+    # sync.stall compares these with the int32 epoch word and the slot
+    # argument: an epoch past int32 or a slot this kernel never runs never fires.
+    if not 0 <= key.fault_epoch < 2**31:
+        raise ValueError(f"{cls}.fault_epoch {key.fault_epoch} (0 .. 2^31 - 1)")
+    if key.fault_slot not in slots:
+        what = "K1" if slots.start == K1_SLOT0 else "K2"
+        raise ValueError(
+            f"{cls}.fault_slot {key.fault_slot}: a {what} slot "
+            f"({slots.start} .. {slots.stop - 1}, spec.{what.lower()}_slot)"
+        )
+    if not 0 < key.fault_ticks < 2**63:
+        raise ValueError(f"{cls}.fault_ticks {key.fault_ticks} (> 0)")
+
+
+def _fault_suffix(key) -> str:
+    if not key.faulty:
+        return ""
+    return f"_f{key.fault_rank}_{key.fault_epoch}_{key.fault_slot}_{key.fault_ticks}"
 
 
 @dataclass(frozen=True)
@@ -175,35 +328,66 @@ class K2Build:
     fault_epoch: int = 0
     fault_slot: int = 0
     fault_ticks: int = 0
+    # Phases B and C, past Phase A's fields (a Phase A key's prefix stays).
+    # The attention core K2 reads (K2_CORES): "tensor" o_proj's input from
+    # vLLM (Phase A), "gated" vLLM's attention output and the qkv rows, the
+    # gated norm in the core load (B2), "split" the split-KV core in-kernel
+    # (C, q = 1 widths).
+    core: str = "tensor"
+    window: bool = False  # split only: a sliding layer's key window
 
     def __post_init__(self):
-        for f in ("tokens", "fault_rank", "fault_epoch", "fault_slot", "fault_ticks"):
-            v = getattr(self, f)
-            if type(v) is not int:  # bool too: it would name the symbol "sTrue"
-                raise TypeError(f"K2Build.{f} = {v!r}: an int")
-        if type(self.debug_dump) is not bool:
-            raise TypeError(f"K2Build.debug_dump = {self.debug_dump!r}: a bool")
-        if not 1 <= self.tokens <= MAX_ROWS:
-            raise ValueError(f"K2Build.tokens {self.tokens} (1 .. {MAX_ROWS})")
-        if not -1 <= self.fault_rank < TP:
-            raise ValueError(f"K2Build.fault_rank {self.fault_rank} (-1 .. {TP - 1})")
-        if not self.faulty:
-            # One build, one key: the fault fields of a build without the hook
-            # would key a second binary under the same kernel name.
-            if (self.fault_epoch, self.fault_slot, self.fault_ticks) != (0, 0, 0):
-                raise ValueError("K2Build.fault_* set without fault_rank")
-            return
-        # sync.stall compares these with the int32 epoch word and the K2 slot
-        # argument: an epoch past int32 or a slot no K2 launch has never fires.
-        if not 0 <= self.fault_epoch < 2**31:
-            raise ValueError(f"K2Build.fault_epoch {self.fault_epoch} (0 .. 2^31 - 1)")
-        if not K2_SLOT0 <= self.fault_slot < TAG_SLOTS:
-            raise ValueError(
-                f"K2Build.fault_slot {self.fault_slot}: a K2 slot "
-                f"({K2_SLOT0} .. {TAG_SLOTS - 1}, spec.k2_slot)"
-            )
-        if not 0 < self.fault_ticks < 2**63:
-            raise ValueError(f"K2Build.fault_ticks {self.fault_ticks} (> 0)")
+        _check_key(
+            self,
+            ("tokens", "fault_rank", "fault_epoch", "fault_slot", "fault_ticks"),
+            ("window", "debug_dump"),
+            range(K2_SLOT0, TAG_SLOTS),
+        )
+        if type(self.core) is not str:
+            raise TypeError(f"K2Build.core = {self.core!r}: a str")
+        if self.core not in K2_CORES:
+            raise ValueError(f"K2Build.core {self.core!r} (one of {K2_CORES})")
+        if self.window and self.core != "split":
+            raise ValueError(f"K2Build.window with core {self.core!r} (split only)")
+
+    @property
+    def faulty(self) -> bool:
+        """The build compiles ``sync.stall`` into its prologue."""
+        return self.fault_rank >= 0
+
+    def kernel_name(self) -> str:
+        """The kernel symbol: one per build. A Phase A build ("tensor") keeps
+        its Phase A name."""
+        if self.core == "split":
+            core = "_sw" if self.window else "_full"
+        else:
+            core = _CORE_SUFFIX[self.core]
+        name = f"muse_mono_k2_s{self.tokens}{core}" + _fault_suffix(self)
+        return name + ("_dbg" if self.debug_dump else "")
+
+
+@dataclass(frozen=True)
+class K1Build:
+    """Every K1 build parameter (Phase B1: the residual boundary, the qkv GEMV,
+    QK-norm / RoPE and the KV insert of one layer), scalars only. One template;
+    ``rope`` is the only difference between the two attention kinds."""
+
+    tokens: int  # S, the launch's rows: 1 .. MAX_ROWS
+    rope: bool  # a sliding layer's GPT-J RoPE (full layers: NoPE)
+    debug_dump: bool = False  # tests: the GEMV rows before the epilogue -> "qkvd"
+    # The fault hook as K2Build's, for a K1 slot (spec.k1_slot).
+    fault_rank: int = -1
+    fault_epoch: int = 0
+    fault_slot: int = 0
+    fault_ticks: int = 0
+
+    def __post_init__(self):
+        _check_key(
+            self,
+            ("tokens", "fault_rank", "fault_epoch", "fault_slot", "fault_ticks"),
+            ("rope", "debug_dump"),
+            range(K1_SLOT0, K2_SLOT0),
+        )
 
     @property
     def faulty(self) -> bool:
@@ -212,15 +396,9 @@ class K2Build:
 
     def kernel_name(self) -> str:
         """The kernel symbol: one per build."""
-        name = f"muse_mono_k2_s{self.tokens}"
-        if self.faulty:
-            name += (
-                f"_f{self.fault_rank}_{self.fault_epoch}_{self.fault_slot}"
-                f"_{self.fault_ticks}"
-            )
-        if self.debug_dump:
-            name += "_dbg"
-        return name
+        kind = "rope" if self.rope else "nope"
+        name = f"muse_mono_k1_s{self.tokens}_{kind}" + _fault_suffix(self)
+        return name + ("_dbg" if self.debug_dump else "")
 
 
 K2_ARGS = (
@@ -253,6 +431,65 @@ K2_ARGS = (
 )
 K2_INT32_ARGS = ("rank", "slot")  # every other argument is an Int64 device address
 
+# K2's arguments by K2Build.core: "gated" reads vLLM's attention output and the
+# qkv rows (og at ROW_G) in place of ``core``; "split" reads the qkv rows, this
+# layer's KV cache and its KV group's block table and sequence lengths. The
+# launch state (the last 7) is every core's.
+K2_KV_ARGS = (
+    "kv",  # bf16 [blocks, KV_HEADS, KV_BLOCK, KV_C]: the layer's cache
+    "kv_sb",  # byte strides of a block, a head, a token (Int64)
+    "kv_sh",
+    "kv_st",
+    "kv_blocks",  # Int32: the cache's blocks (block ids are clamped below it)
+)
+K2_ARGS_BY_CORE = {
+    "tensor": K2_ARGS,
+    "gated": (
+        "attn",  # bf16 [S, CORE]: the stock core's output, contiguous
+        "qkvo",  # bf16 [S, QKV_ROWS]: the qkv rows (og at ROW_G)
+        *K2_ARGS[1:],
+    ),
+    "split": (
+        "qkvo",  # bf16 [S, QKV_ROWS]: q normalized and roped, og raw
+        *K2_KV_ARGS,
+        "block_table",  # int32 [bt_rows, bt_stride]: the KV group's (persistent)
+        "bt_rows",  # Int32: the table's rows (its buffer's size)
+        "bt_stride",  # Int32: the table's row stride in entries
+        "seq_lens",  # int32 [>= S]: context lengths, this step's token included
+        *K2_ARGS[1:],
+    ),
+}
+K2_INT32_ARGS_BY_CORE = {
+    "tensor": K2_INT32_ARGS,
+    "gated": K2_INT32_ARGS,
+    "split": ("kv_blocks", "bt_rows", "bt_stride", *K2_INT32_ARGS),
+}
+
+K1_ARGS = (
+    "branch",  # bf16 [S, HIDDEN]: the previous layer's deferred branch
+    "stream",  # fp32 [S, HIDDEN]: the residual stream
+    "pad",  # bool [>= S]: pad rows
+    "positions",  # int64 [>= S]
+    "slots",  # int64 [>= S]: this layer's slot mapping (< 0: no insert)
+    "w_postffn",  # layer i - 1: post_ffn_norm.weight bf16
+    "ffn_alpha",  # layer i - 1: add_ffn alpha / beta fp32
+    "ffn_beta",
+    "w_preqkv",  # layer i: pre_qkv_proj_norm.weight bf16
+    "w_qkv",  # layer i: qkv_proj.weight bf16 [QKV_ROWS, HIDDEN]
+    "cos_sin",  # layer i: rotary cos_sin_cache fp32 [max_pos, 64] (0 if NoPE)
+    *K2_KV_ARGS,
+    "max_pos",  # Int32: cos_sin's rows (positions are clamped below it)
+    "stream_out",  # fp32 [S, HIDDEN]: K2's stream
+    "qkvo",  # bf16 [S, QKV_ROWS]: the qkv rows after QK-norm / RoPE
+    "scratch",
+    "rank",  # no peers: K1 is rank-local; stall() compares the rank
+    "epoch",
+    "slot",
+    "health",
+    "alarm",
+)
+K1_INT32_ARGS = ("kv_blocks", "max_pos", "slot", "rank")
+
 # --------------------------------------------------------------------------
 # Scratch and peer layouts (section 5.10 of the design)
 
@@ -271,7 +508,7 @@ SCRATCH_REGIONS = (
     "upart",
 )
 PEER_REGIONS = ("ar", "rlog", "pool", "rsx", "sqx", "moe", "branch")
-REGIONS = SCRATCH_REGIONS + PEER_REGIONS
+K2_REGIONS = SCRATCH_REGIONS + PEER_REGIONS  # every K2 core puts and polls these
 # Plain (untagged) scratch regions, after the mailboxes.
 XQD = "xqd"  # debug_dump builds only: CTA 0's xq / xsc words
 XROW = "xrow"  # bf16 [MAX_TOKENS, HIDDEN]: ffn_in rows (seam -> router, pooler)
@@ -293,6 +530,41 @@ SCRATCH_PAIRS = (
 XQD_PAIRS = _MT * (XQ_WORDS + XSC_WORDS)
 XQD_ROW_WORDS = XQ_WORDS + XSC_WORDS  # a row's plain words: xq, then xsc
 XROW_BYTES = _MT * HIDDEN * 2
+
+# Phases B and C (DESIGN_BC 5.7): mailboxes, then plain regions, laid out past
+# ``xrow`` so that every Phase A offset (and every Phase A K2 binary) stays.
+SCRATCH_PAIRS_BC = (
+    ("fss", NA * _MT),  # j*MT + t: K1 boundary, fp32 sum of x^2 over slice j
+    ("nss", NA * _MT),  # j*MT + t: fp32 sum of new_stream^2 over slice j
+    ("ardy", NA),  # j: K1 boundary slice j's arow published (flag)
+    ("qpart", QKV_TILES * K1_MAXC * _MT * ROWS),  # ((T*2 + c)*MT + t)*16 + r
+    ("srdy", BLOCKS),  # u: split unit u's opart / pstat published (flag)
+    ("crdy", 16 * _MT),  # 16 t + h: combine (t, h)'s xo row published (flag)
+)
+SCRATCH_REGIONS_BC = tuple(n for n, _ in SCRATCH_PAIRS_BC)
+SCRATCH_REGIONS_ALL = SCRATCH_REGIONS + SCRATCH_REGIONS_BC
+K1_REGIONS = ("fss", "nss", "ardy", "qpart")  # K1 puts and polls these
+SPLIT_REGIONS = ("srdy", "crdy")  # ... and K2(split) these, past K2_REGIONS
+# Every region a wait record may name (debug.region_ids; ids are name CRCs, so
+# the order is free).
+REGIONS = SCRATCH_REGIONS_ALL + PEER_REGIONS
+
+# Plain (untagged) regions past the B/C mailboxes: (name, bytes, alignment).
+AROW = "arow"  # bf16 [MT, HIDDEN]: K1's attn_in rows (boundary -> GEMV)
+QKVD = "qkvd"  # bf16 [MT, QKV_ROWS]: debug K1 builds' GEMV rows (epilogue -> tests)
+XO = "xo"  # bf16 [MT, CORE]: the split core's gated rows (combine -> load_core)
+PSTAT = "pstat"  # fp32 [BLOCKS, 8, 2]: a split unit's (m, l) per q head
+OPART = "opart"  # fp32 [BLOCKS, 8, HEAD_DIM]: a split unit's unnormalized rows
+SCRATCH_PLAIN_BC = (
+    (AROW, _MT * HIDDEN * 2, 16),
+    (QKVD, _MT * QKV_ROWS * 2, 16),
+    (XO, _MT * CORE * 2, 16),
+    (PSTAT, BLOCKS * Q_PER_KV * 2 * 4, 16),
+    (OPART, BLOCKS * Q_PER_KV * HEAD_DIM * 4, 16),
+)
+# Plain regions read inside the launch that wrote them: stored and loaded with
+# CM_DEV, never through SMEM (each XCD has its own L2; DESIGN_BC rule 9).
+IN_LAUNCH_PLAIN = (XROW, AROW, XO, PSTAT, OPART)
 
 # One parity half; pair indexes are in the reader's buffer.
 PEER_PAIRS = (
@@ -321,14 +593,21 @@ def _end(layout: dict) -> int:
     return max(off + size for off, size in layout.values())
 
 
+def _align(off: int, align: int) -> int:
+    return (off + align - 1) // align * align
+
+
 def scratch_layout() -> dict[str, tuple[int, int]]:
     """A rank's scratch (one buffer shared by every launch of a step; the tags
     tell launches apart): the mailboxes, then ``xqd``, then ``xrow``
-    (16-byte aligned). name -> (byte offset, bytes)."""
+    (16-byte aligned); then Phases B / C's mailboxes and plain regions.
+    name -> (byte offset, bytes)."""
     out = pair_layout(SCRATCH_PAIRS)
     out.update(pair_layout(((XQD, XQD_PAIRS),), start=_end(out)))
-    xrow = (_end(out) + XROW_ALIGN - 1) // XROW_ALIGN * XROW_ALIGN
-    out[XROW] = (xrow, XROW_BYTES)
+    out[XROW] = (_align(_end(out), XROW_ALIGN), XROW_BYTES)
+    out.update(pair_layout(SCRATCH_PAIRS_BC, start=_end(out)))
+    for name, nbytes, align in SCRATCH_PLAIN_BC:
+        out[name] = (_align(_end(out), align), nbytes)
     return out
 
 
@@ -391,7 +670,7 @@ def xrdy_pair(j):
 
 
 def ss_pair(j, t):
-    """``ass`` and ``bss``."""
+    """``ass`` and ``bss`` (K2's seam); ``fss`` and ``nss`` (K1's boundary)."""
     return j * _MT + t
 
 
@@ -423,6 +702,23 @@ def upart_pair(g, q, t, r):
     return ((g * (U_PARTS - 1) + q - 1) * _MT + t) * ROWS + r
 
 
+def ardy_pair(j):
+    return j
+
+
+def qpart_pair(T, c, t, r):
+    """K1: contributor c's partial of qkv tile T's row r for token t."""
+    return ((T * K1_MAXC + c) * _MT + t) * ROWS + r
+
+
+def srdy_pair(u):
+    return u
+
+
+def crdy_pair(t, h):
+    return 16 * t + h
+
+
 # Plain (untagged) regions: word / element indexes from the region's base.
 
 
@@ -441,3 +737,29 @@ def xqd_xsc_word(t, kb):
 def xrow_elem(t, col):
     """``xrow`` bf16 element of row t, column col."""
     return t * HIDDEN + col
+
+
+def arow_elem(t, col):
+    """``arow`` bf16 element of row t, column col."""
+    return t * HIDDEN + col
+
+
+def qkvd_elem(t, row):
+    """``qkvd`` bf16 element of token t's qkv row ``row``."""
+    return t * QKV_ROWS + row
+
+
+def xo_elem(t, h, d):
+    """``xo`` bf16 element of token t, q head h, dim d."""
+    return t * CORE + HEAD_DIM * h + d
+
+
+def pstat_word(u, j, k):
+    """``pstat`` fp32 word of split unit u, its q head j (of 8), k = 0: the
+    running max m (base 2), k = 1: the sum l."""
+    return (u * Q_PER_KV + j) * 2 + k
+
+
+def opart_word(u, j, d):
+    """``opart`` fp32 word of split unit u, its q head j, dim d."""
+    return (u * Q_PER_KV + j) * HEAD_DIM + d

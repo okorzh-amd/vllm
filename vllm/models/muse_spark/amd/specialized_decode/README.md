@@ -40,9 +40,26 @@ vllm serve amd/Muse-Spark-Open-816B-A42B-Quark-MXFP4 -tp 8 \
 ```
 
 `--monokernel` and `--additional-config '{"decode_backend": "latency_specialized"}'`
-are the same switch. There are no other options. `decode_backend=auto` (the
-default) without `--monokernel` runs vLLM's decode; any other `decode_backend`
-value is an error.
+are the same switch. `decode_backend=auto` (the default) without `--monokernel`
+runs vLLM's decode; any other `decode_backend` value is an error.
+
+That switch alone serves Phase A. Phases B and C (see Phases) are off by default
+and are selected in the same `additional_config`, each on its own:
+
+```bash
+--additional-config '{"decode_backend": "latency_specialized",
+  "mono_front": "k1", "mono_core": "split"}'
+```
+
+`mono_front` is `stock` (the default) or `k1`, `mono_core` is `tensor` (the
+default), `gated` or `split`.
+
+`mono_core: "gated"` is B2, `mono_front: "k1"` is B1 and `mono_core: "split"` is
+C; `split` serves `q = 1` widths, and DSpark verify widths keep `gated`. With K1
+on, `mono_k1_min_width` (1..8) leaves narrower widths on vLLM's front. An unknown
+value fails at startup, before anything collective runs. A tree without a kernel
+(no `mono/k1.py`, a core missing from `mono.layer.ABI_BY_CORE`) refuses the
+deployment at startup.
 
 `VLLM_MOE_SKIP_PADDING=1` is required: the kernels read the step's pad-row mask
 (`forward_context.is_padding`), which Model Runner V2 refreshes every step only
@@ -85,7 +102,11 @@ reason, in three stages:
   last dimension (Phase A does not read the KV cache; these hold the Phase B/C
   contract), and the resolved decode CUDA-graph mode (PIECEWISE).
 
-Every TP rank agrees on each verdict before anything collective runs.
+Phases B and C add weight and cache rows (the qkv and norm weights K1 reads,
+the attention kind's window and RoPE, the attention options, the KV block size,
+16-byte rows and the 32-bit page window). They apply only when a kernel that
+reads them is on, so a Phase A deployment is refused for exactly what it was
+before. Every TP rank agrees on each verdict before anything collective runs.
 
 ## Steps, widths and padding
 
@@ -176,10 +197,13 @@ follow-up.
 Mailbox tags are `(epoch & (2^22 - 1)) * 256 + slot + 1`, with a device step
 epoch the runner bumps once a kernel step (inside the graph); nothing is ever
 zeroed. **Aliasing window:** a pair last written a multiple of 2^22 epochs
-earlier by the same launch slot carries the current tag. Only the rows past a
-narrow step's width go unwritten, so a wide step exactly 2^22 kernel steps (about
-35 h at 30 ms a step) after the previous wide step could accept stale data in a
-pair polled before its producer wrote it. This is accepted.
+earlier by the same launch slot carries the current tag. Only pairs a launch
+does not write keep an older tag: the rows past a narrow step's width and, once
+Phase C's split core runs, the split flags past a launch's unit count (a split
+flag's unit depends on the width and the layer kind). So a launch exactly 2^22
+kernel steps (about 35 h at 30 ms a step) after the last one that wrote such a
+pair could accept stale data in a pair polled before its producer wrote it.
+This is accepted.
 
 `tests/models/muse_spark/amd_specialized_decode/test_engine_fault.py` stalls a
 rank in a served model and checks that the engine stops.
@@ -193,16 +217,18 @@ scratch spills, LDS within 160 KiB) and on `known_block_size=[512, 1, 1]` in the
 kernel decorator (without it the compiler assumes 1024 threads a block, caps
 VGPRs at 128 and spills). The LDS is a fixed 8 KiB `red` buffer, the ~4 KiB route
 table and one union of the stage structs (the pooler's 32.9 KiB at 8 rows is
-the largest): about 17-45 KiB per build. Model Runner V2 side streams can occupy CUs briefly;
-that costs latency, not progress. Do not co-schedule other GPU work on the
-devices.
+the largest): about 17-45 KiB per build (29.5 KiB at 1 row for a split build;
+K1, with its residency pin, 80-106 KiB). Model Runner V2 side streams can occupy
+CUs briefly; that costs latency, not progress. Do not co-schedule other GPU work
+on the devices.
 
 ## Layout
 
 Everything lives in this folder. The model files only call in:
 `amd/model.py` (the config check in `__init__`, `plan_specialized_decode` in
 `forward`, `step.layer(i)` in the layer loop, `after_specialized_decode_step` in
-`compute_logits`, `skip_o_proj` in the attention, `get_model_state_cls`) and
+`compute_logits`, `skip_o_proj` in the attention and its `front` / `attend`
+split for Phases B and C, `get_model_state_cls`) and
 `amd/model_state.py` (builds the executor after load, binds KV caches, votes
 after capture).
 
@@ -218,10 +244,15 @@ runtime/
     runner.py      per-rank launch state: scratch, step epoch, health, peers
     peer.py        peer memory and TP agreement (adapted from ROCm/ATOM, MIT)
 mono/              kernel source
-    spec.py        the shared contract: shapes, placement, build key, layouts
+    spec.py        the shared contract: shapes, placements, build keys,
+                   argument lists, layouts (Phases A, B and C)
     abi.py         the error-word layout
-    layer.py       K2
-    attention/     back.py (o_proj + all-reduce push)
+    layer.py       K2 (core variants: tensor, gated, split)
+    k1.py          K1 (Phase B1)
+    front/         K1's stages: boundary, qkv GEMV, epilogue (QK-norm / RoPE /
+                   KV insert)
+    attention/     back.py (o_proj + all-reduce push), gate.py (the gated
+                   norm), split.py and combine.py (the split-KV core)
     stages/        seam, router, pool, experts, reduce, unpool, gemv
     common/        device ops, mailbox sync, MX helpers, plan / build keys,
                    the route table and probe context (adapted from ROCm/ATOM
@@ -231,10 +262,76 @@ mono/              kernel source
 ## Phases
 
 - **A (this):** stock attention up to o_proj's input, then K2.
-- **B:** a K1 launch per kernel layer replaces the stock front (the residual
+- **B2:** K2 reads the stock attention output and the qkv rows and applies the
+  gated norm in its core load (`K2Build.core = "gated"`); the stock front stays.
+- **B1:** a K1 launch per kernel layer replaces the stock front (the residual
   boundary, the QKV GEMV, QK-norm/RoPE, the KV insert) and stock attention reads
-  its output; K2 is unchanged. The tag slots (K1: the layer index, K2: 128 + the
-  layer index) and the scratch tail are reserved for it.
-- **C:** the split-KV GQA attention core moves into K2 for `q = 1` widths; DSpark
-  verify widths keep the stock core until the split masks causally per query
-  row. DSpark stays supported.
+  its output. K1 is rank-local; one template, RoPE on for sliding layers
+  (`K1Build`, `muse_mono_k1_s{S}_{rope,nope}`).
+- **C:** the split-KV GQA attention core moves into K2 for `q = 1` widths
+  (`core = "split"`, a window for sliding layers: `_sw` / `_full` builds);
+  DSpark verify widths keep the stock core with the gated core load, since the
+  split does not mask causally per query row. DSpark stays supported.
+
+The phases ship independently (Enabling); each is built and CPU-tested, and
+none has yet run on a GPU. `mono/spec.py` holds their whole contract: the build
+keys (a `core = "tensor"` key is a Phase A build, with its Phase A name and
+binary), the argument lists, the placements and the scratch layout (B / C
+regions past Phase A's, so every Phase A offset stays; 1.5 MB a rank in all).
+The tag slots are K1: the layer index, K2: 128 + the layer index, so a step's K1
+and K2 pairs never alias.
+
+- **K2(gated)** (B2) takes `attn` and `qkvo` in place of `core`. Its core load
+  (`attention/gate.py`) issues the attention output and o_gate loads first, then
+  the o_proj weights, and computes FLA's `rms_norm_gated` bit for bit into `xl`;
+  `test_compile_gated.py` pins the order (no wait between the first weight load
+  and the last `xl` write retires a weight load).
+- **K1** (`mono/k1.py`) is one launch a kernel layer and rank on the K2 grid,
+  its roles split by CTA so that no CTA polls or publishes with another task's
+  loads in flight. It builds its context with `make_context(..., peers=False,
+  route_lds=False)`: no `peers` argument, no peer regions, no route table, and
+  only `alarm` leaves the rank.
+    - CTAs 0-63 run the boundary (`front/boundary.py`): K2's seam with the
+    deferred branch in place of the all-reduce and the previous layer's
+    `post_ffn_norm` weight applied first; past its input both run
+    `stages/seam.py`'s `blend_norm`. They exchange the per-slice sums of
+    squares over `fss` / `nss` and publish each slice's `arow` (device scope)
+    behind its `ardy` flag.
+    - CTAs 64-255 run the qkv GEMV (`front/qkv.py`): 12 (tile, 512-column K part)
+    tasks each, all their weights in flight from entry, the `arow` rows staged
+    into LDS in one pass behind the `ardy` flags. Every tile has two
+    contributors.
+    - CTAs 0 .. 5S - 1 then run the epilogue (`front/epilogue.py`, 5 CTAs a token,
+    a head a wave): it adds the two fp32 partials, rounds to bf16 once and
+    reproduces the stock fused QK-norm / RoPE / KV insert's gfx950 arithmetic bit
+    for bit (including the uneven RoPE pairs of dims 0 and 7), writing `qkvo`
+    and, for slots >= 0, the K / V cache. A rank that has FAILED writes no K / V.
+    - Every build holds more than half a CU's LDS (a residency pin in its stage
+    union), so the dispatcher places one CTA a CU at every width.
+- **K2(split)** (C, `q = 1` widths) runs the attention core in the launch. The
+  first `n_units(S, kind)` CTAs each attend one split-KV unit
+  (`attention/split.py`). The last 16 S CTAs each merge one (token, q head)
+  (`attention/combine.py`): a combine waits only for the units that hold keys,
+  merges their base-2 partials at device scope, rounds the attention output to
+  bf16 as the stock core does and applies the gate (`gate.o_gate`), so `xo`
+  equals `rms_norm_gated` of that output bit for bit. A CTA issues its o_proj
+  weights only after its last publish (at entry if it has no role), so no flag
+  waits on a weight stream; the core load (`split.load_core`) then waits for
+  the combine's flags with only those weights in flight. `test_compile_split.py`
+  pins that order, the split loop's two pages in flight, device-scope merge
+  loads and no scalar reads of the in-launch regions.
+
+K1 and the split core read MRV2's persistent metadata buffers (slot mappings,
+block tables, sequence lengths, positions, the pad mask). The KV bind pins each
+kernel layer's table and slot mapping to its group's persistent buffers, and
+every `plan()` checks their addresses (the first plan of each FULL graph is its
+capture), so a builder that broke persistence stops the startup.
+
+Two guards keep the phases honest without a GPU. `test_compile.py` compares
+every Phase A build's final ISA with `k2_isa_baseline.json`, recorded from the
+Phase A sources: B and C must leave Phase A launches bit-identical.
+`test_stock_isa_pin.py` pins the gfx950 code of the two stock kernels Phase B
+reproduces bit for bit, the fused QK-norm / RoPE / KV insert (read from vLLM's
+own code object) and FLA's `rms_norm_gated` (compiled for gfx950), so a
+compiler, Triton or kernel-source change that would alter their rounding fails
+on CPU first.

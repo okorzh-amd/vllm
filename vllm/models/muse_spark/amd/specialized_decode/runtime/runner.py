@@ -60,6 +60,7 @@ class MonoRunner:
         self.alarm = int(self.peers.addresses[0].item()) + 4 * self.rank
         self.flags = self.peers.bytes[: 4 * tp.world_size].view(torch.int32)
         self.fault: dict = {}  # K2Build's fault_* fields (tests only)
+        self.fault_k1: dict = {}  # K1Build's (tests only)
         self.first_layer = -1  # the step's first kernel layer: bumps the epoch
         # the served-steps log (count_step)
         self.steps = 0

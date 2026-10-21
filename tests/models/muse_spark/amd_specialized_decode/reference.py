@@ -40,9 +40,33 @@ exactly to nearest even by midpoints (``fp4_round``'s ``+1e-6`` odd penalty
 rounded values just below a midpoint up); routing takes the 8 lowest-index
 argmax steps and a serial pick-order sum (``fused_routing.py:100-118``), not
 ``torch.topk`` and a vector sum.
+
+Phases B and C (DESIGN_BC sections 1.3, 1.4, 4) add the attention front and
+core, and what their tests feed the kernels:
+
+    ffn_boundary  the previous layer's B_ffn boundary into this one
+                  (``fused_norm_residual_norm_fwd`` with the post weight first)
+    qk_norm_rope  the fused insert's QK-norm and GPT-J RoPE in the gfx950
+                  rounding order of its HEADS_PER_GROUP 1 instance (1.3)
+    front         the qkv rows as K1 leaves them, and ``kv_insert``
+    gated_norm    ``rms_norm_gated`` in Triton's gfx950 reduction order (1.4,
+                  ``gated_sumsq``: the runtime-specialized instance's)
+    gqa_decode    fp64 GQA decode through a block table, sliding or full
+    FakeMrv2      MRV2's persistent block tables, slot mappings, sequence
+                  lengths, positions and pad flags, written in place a step
+    kv_cache      KV cache fixtures (LBHNC / LHBNC), page assignment, and
+    poison_unread NaN in every cache byte the split core must never read
+
+The rounding-order references reproduce every rounding point of the stock
+gfx950 code but compute the hardware's approximate ops (``v_rsq_f32``,
+``v_sqrt_f32``, ``v_exp_f32``) correctly rounded, so they may differ from the
+GPU in the last fp32 bit there; the GPU probes compare with the stock kernels
+themselves for bit-exactness.
 """
 
-from collections.abc import Sequence
+import math
+from collections.abc import Collection, Mapping, Sequence
+from types import SimpleNamespace
 
 import torch
 
@@ -405,3 +429,395 @@ def k2(core, stream, pad, w) -> dict:
         "moe": moe,
         "branch": unpooler(moe, w["w_unpool"], pad),
     }
+
+
+# ---------------------------------------------------------------- B / C: fp32
+
+
+def fma32(a, b, c) -> torch.Tensor:
+    """Correctly rounded fp32 ``a * b + c`` (``v_fma_f32`` / ``v_pk_fma_f32``,
+    ``fmath.fma``) on fp32 tensors. The fp64 product is exact; TwoSum recovers
+    the fp64 sum's rounding error, and a sum that landed exactly on an fp32
+    midpoint goes to the side of that error (no double rounding)."""
+    a, b, c = torch.broadcast_tensors(*(torch.as_tensor(v).float() for v in (a, b, c)))
+    p = a.double() * b.double()
+    cd = c.double()
+    s = p + cd
+    bv = s - p
+    err = (p - (s - bv)) + (cd - bv)
+    r = s.float()
+    inf = torch.full_like(r, math.inf)
+    side = torch.where(
+        s > r.double(), torch.nextafter(r, inf), torch.nextafter(r, -inf)
+    )
+    tie = (s == (r.double() + side.double()) * 0.5) & (err != 0) & s.isfinite()
+    fix = torch.where(err > 0, torch.maximum(r, side), torch.minimum(r, side))
+    return torch.where(tie, fix, r)
+
+
+def _f32(v: float) -> torch.Tensor:
+    return torch.tensor(v, dtype=F32)
+
+
+# ---------------------------------------------------------------- B: K1
+
+
+def ffn_boundary(branch, stream, w_postffn, alpha, beta, w_preqkv, pad=None):
+    """The B_ffn boundary into a layer (K1, DESIGN_BC 4 / 5.4): (``stream_out``
+    fp32, ``attn_in`` bf16). The previous layer's ``post_ffn_norm`` scales its
+    input first, ``x = RN(f32(branch) (w_post + 1))``, ``y = x rsqrt(mean x^2 +
+    1e-8)``; ``n = alpha s + beta y``; ``attn_in = bf16(n rsqrt(mean n^2 +
+    1e-5) (w_pre + 1))``. Pad rows: exact zeros."""
+    pad = _pad_mask(pad, stream.shape[0], stream.device)
+    x = branch.float() * (w_postffn.float() + spec.GAIN)
+    y = x * _rsq(x, spec.POST_FFN_EPS)
+    n = _zero_rows(alpha.float() * stream.float() + beta.float() * y, pad)
+    z = (n * _rsq(n, spec.RMS_EPS)) * (w_preqkv.float() + spec.GAIN)
+    return n, _zero_rows(z.to(BF16), pad)
+
+
+def stream_tolerance(branch, stream, w_postffn, alpha, beta) -> torch.Tensor:
+    """The ``stream_out`` bound (DESIGN_BC 4): ``1e-5 (|alpha s| + |beta y|)``,
+    elementwise; a relative bound fails where ``alpha s + beta y`` cancels."""
+    x = branch.float() * (w_postffn.float() + spec.GAIN)
+    y = x * _rsq(x, spec.POST_FFN_EPS)
+    return 1e-5 * ((alpha.float() * stream.float()).abs() + (beta.float() * y).abs())
+
+
+def rope_table(max_pos: int, theta: float = spec.ROPE_THETA, device="cpu"):
+    """A ``cos_sin_cache`` as ``RotaryEmbedding(64, 64, ..., dtype=float)``
+    builds it: fp32 [max_pos, 64], cos in columns 0 .. 31, sin in 32 .. 63."""
+    inv = 1.0 / (theta ** (torch.arange(0, 64, 2, dtype=F32) / 64))
+    freqs = torch.outer(torch.arange(max_pos, dtype=F32), inv)
+    return torch.cat([freqs.cos(), freqs.sin()], -1).to(device)
+
+
+def qk_norm_rope(heads: torch.Tensor, cs: torch.Tensor | None) -> torch.Tensor:
+    """The fused insert's QK-norm and RoPE of bf16 heads [N, 64] (DESIGN_BC
+    1.3): per 8-dim chunk (a lane) a serial sum of rounded squares, the 8-lane
+    tree ``((s0+s4)+(s2+s6)) + ((s1+s5)+(s3+s7))``, ``rsq(fma(sum, 2^-6,
+    eps))``, ``RN(x r)``; then, with ``cs`` (fp32 [N, 64]: each head's
+    position's table row), the uneven GPT-J pair table; one bf16 rounding."""
+    x = heads.float().reshape(-1, 8, 8)  # [N, lane li, dim k]: dim 8 li + k
+    sq = x * x
+    s = sq[..., 0]
+    for k in range(1, 8):
+        s = s + sq[..., k]
+    tot = ((s[:, 0] + s[:, 4]) + (s[:, 2] + s[:, 6])) + (
+        (s[:, 1] + s[:, 5]) + (s[:, 3] + s[:, 7])
+    )
+    r = torch.rsqrt(tot * _f32(2.0**-6) + _f32(spec.RMS_EPS))
+    x = x * r.view(-1, 1, 1)
+    if cs is not None:
+        c = cs[:, :32].float().reshape(-1, 8, 4)  # pair i of lane li: 4 li + i
+        sn = cs[:, 32:].float().reshape(-1, 8, 4)
+        xe, xo = x[..., 0::2], x[..., 1::2]  # dims 2i, 2i + 1 of the chunk
+        out = torch.empty_like(x)
+        out[..., 0] = xe[..., 0] * c[..., 0] - xo[..., 0] * sn[..., 0]  # no fma
+        out[..., 1] = fma32(xo[..., 0], c[..., 0], xe[..., 0] * sn[..., 0])
+        for i in (1, 2, 3):
+            out[..., 2 * i] = fma32(xe[..., i], c[..., i], -(xo[..., i] * sn[..., i]))
+        for i in (1, 2):
+            out[..., 2 * i + 1] = fma32(xo[..., i], c[..., i], xe[..., i] * sn[..., i])
+        # dim 7: the fused product is x6 s3, the rounded one x7 c3
+        out[..., 7] = fma32(xe[..., 3], sn[..., 3], xo[..., 3] * c[..., 3])
+        x = out
+    return x.reshape(heads.shape).to(BF16)
+
+
+def front(qkv, positions, cos_sin=None, pad=None, *, zero_pad=True) -> torch.Tensor:
+    """K1's ``qkvo`` from bf16 GEMV rows ``qkv`` [S, QKV_ROWS]: q and k heads
+    normalized (and roped with ``cos_sin``, positions clamped to its rows; a
+    pad row's position is 0), v and o_gate verbatim; pad rows zero (stock
+    writes values there). ``zero_pad=False`` keeps a pad row's values: the K
+    and V K1 inserts for it (DESIGN_BC 5.6 stores ``bf16(x)``, not the zeroed
+    row, when the pad row's slot is >= 0)."""
+    S = qkv.shape[0]
+    pad = _pad_mask(pad, S, qkv.device)
+    out = qkv.clone()
+    nq = spec.HEADS + spec.KV_HEADS  # q heads, then k heads: rows [0, ROW_V)
+    heads = qkv[:, : spec.ROW_V].reshape(S * nq, spec.HEAD_DIM)
+    cs = None
+    if cos_sin is not None:
+        pos = torch.where(pad, 0, positions[:S].long().to(qkv.device))
+        pos = pos.clamp(0, cos_sin.shape[0] - 1)
+        cs = cos_sin[pos].repeat_interleave(nq, 0)
+    out[:, : spec.ROW_V] = qk_norm_rope(heads, cs).view(S, -1)
+    return _zero_rows(out, pad) if zero_pad else out
+
+
+def kv_insert(kv: torch.Tensor, qkvo: torch.Tensor, slots) -> torch.Tensor:
+    """The KV insert of ``qkvo``'s k and v heads into ``kv`` [blocks,
+    KV_HEADS, KV_BLOCK, KV_C], in place: slot >= 0 only (and inside the
+    cache, as K1 clamps); returns ``kv``. The insert does not look at the pad
+    flags: with pad rows, pass ``front(..., pad, zero_pad=False)``."""
+    for t in range(qkvo.shape[0]):
+        slot = int(slots[t])
+        blk, n = divmod(slot, spec.KV_BLOCK)
+        if slot < 0 or blk >= kv.shape[0]:
+            continue
+        for h in range(spec.KV_HEADS):
+            k = qkvo[t, spec.ROW_K + 64 * h : spec.ROW_K + 64 * (h + 1)]
+            v = qkvo[t, spec.ROW_V + 64 * h : spec.ROW_V + 64 * (h + 1)]
+            kv[blk, h, n, : spec.V_OFF] = k.to(kv.device)
+            kv[blk, h, n, spec.V_OFF :] = v.to(kv.device)
+    return kv
+
+
+# ---------------------------------------------------------------- B / C: core
+
+
+def gated_sumsq(x: torch.Tensor) -> torch.Tensor:
+    """fp32 [N] sum of squares of each row of 64 (``x`` [..., 64]) in the
+    order of the gfx950 ``tl.sum(x * x)`` that ``rms_norm_gated`` runs as
+    served (DESIGN_BC 1.4): the runtime specialization lays a row over 32
+    lanes, two adjacent columns a lane, so the leaf is ``s_c = RN(x_2c^2) +
+    RN(x_2c+1^2)``, then the butterfly over lanes xor 16, 8, 4, 2, 1, i.e.
+    pairwise halving of s: ``s[:16] + s[16:]``, then 8, 4, 2, 1."""
+    sq = x.float().reshape(-1, 64) ** 2
+    s = sq[:, 0::2] + sq[:, 1::2]
+    while s.shape[1] > 1:
+        h = s.shape[1] // 2
+        s = s[:, :h] + s[:, h:]
+    return s[:, 0]
+
+
+def gated_norm(attn, og, pad=None) -> torch.Tensor:
+    """``rms_norm_gated(attn, og, None, None, "sigmoid", eps=1e-5)`` per (token,
+    head) row of 64 in the order of the gfx950 instance served (DESIGN_BC
+    1.4): ``tot = gated_sumsq(x)``; ``rstd = 1 / sqrt(fma(tot, 2^-6, eps))``;
+    ``y = RN(RN(x rstd) sigmoid(g))``, one bf16 rounding. Pad rows: zeros.
+    bf16, ``attn``'s shape."""
+    S = attn.shape[0]
+    pad = _pad_mask(pad, S, attn.device)
+    x = attn.float().reshape(-1, 64)
+    tot = gated_sumsq(x)
+    rstd = _f32(1.0) / torch.sqrt(tot * _f32(2.0**-6) + _f32(spec.RMS_EPS))
+    y = (x.reshape(-1, 64) * rstd.view(-1, 1)) * sigmoid(og.reshape(-1, 64))
+    return _zero_rows(y.reshape(attn.shape).to(BF16), pad)
+
+
+def gqa_decode(
+    q, kv, block_table, seq_lens, *, window: bool, scale=spec.QK_SCALE, pad=None
+) -> torch.Tensor:
+    """fp64 decode attention of each row's q heads (bf16 [S, HEADS * 64] or
+    [S, HEADS, 64], as K1 leaves them) over its keys ``lo <= k < L`` through
+    the block table: ``L = clamp(seq_lens[t], 0, 16 * table row)``, ``lo = L -
+    WINDOW`` for a sliding layer (else 0), key k on page ``block_table[t, k //
+    16]`` row ``k % 16``; q head h reads KV head ``h // 8``. ``kv`` is a
+    layer's cache [blocks, KV_HEADS, KV_BLOCK, KV_C], any strides. Pad rows
+    and ``L == 0``: zeros. fp64 [S, HEADS, 64] (exact softmax)."""
+    S = q.shape[0]
+    pad = _pad_mask(pad, S, "cpu")
+    out = torch.zeros(S, spec.HEADS, spec.HEAD_DIM, dtype=F64)
+    cap = block_table.shape[1] * spec.KV_BLOCK
+    for t in range(S):
+        L = min(max(int(seq_lens[t]), 0), cap)
+        if bool(pad[t]) or L == 0:
+            continue
+        lo = max(0, L - spec.WINDOW) if window else 0
+        k = torch.arange(lo, L)
+        blocks = block_table[t].cpu().long()[k // spec.KV_BLOCK]
+        rows = kv[blocks.to(kv.device), :, (k % spec.KV_BLOCK).to(kv.device)]
+        rows = rows.cpu().double()  # [keys, KV_HEADS, KV_C]
+        K, V = rows[..., : spec.V_OFF], rows[..., spec.V_OFF :]
+        qh = q[t].cpu().double().reshape(spec.KV_HEADS, spec.Q_PER_KV, -1)
+        p = torch.softmax(torch.einsum("gjd,ngd->gjn", qh, K) * scale, -1)
+        out[t] = torch.einsum("gjn,ngd->gjd", p, V).reshape(spec.HEADS, -1)
+    return out
+
+
+# ---------------------------------------------------------------- KV fixtures
+
+PAD_SLOT = -1  # MRV2's PAD_SLOT_ID: no insert
+
+
+def kv_cache(
+    num_blocks: int,
+    *,
+    layout: str = "LBHNC",
+    null: float = math.nan,
+    device="cpu",
+    generator: torch.Generator | None = None,
+) -> torch.Tensor:
+    """A layer's bf16 cache [num_blocks, KV_HEADS, KV_BLOCK, KV_C] as AITER FA
+    may lay it out: "LBHNC" (a block's heads adjacent, contiguous) or "LHBNC"
+    (head-major storage: ``stride(1) > stride(0)``). Random normal values;
+    block 0, the null block, holds ``null`` (NaN: a read of it shows)."""
+    dims = (num_blocks, spec.KV_HEADS, spec.KV_BLOCK, spec.KV_C)
+    if layout == "LBHNC":
+        kv = torch.randn(*dims, generator=generator)
+    elif layout == "LHBNC":
+        kv = torch.randn(dims[1], dims[0], *dims[2:], generator=generator)
+        kv = kv.transpose(0, 1)
+    else:
+        raise ValueError(f"KV layout {layout!r} (LBHNC or LHBNC)")
+    kv = kv.to(device=device, dtype=BF16)
+    kv[0] = null
+    return kv
+
+
+def assign_pages(
+    seq_lens: Sequence[int],
+    num_blocks: int,
+    *,
+    extra: int = 0,
+    generator: torch.Generator | None = None,
+) -> list[list[int]]:
+    """Distinct random physical blocks (never 0, the null block) for each
+    request's ``cdiv(L, 16) + extra`` pages, in page order."""
+    need = [-(-L // spec.KV_BLOCK) + extra for L in seq_lens]
+    perm = torch.randperm(num_blocks - 1, generator=generator) + 1
+    if sum(need) > perm.numel():
+        raise ValueError(f"{sum(need)} pages > {num_blocks - 1} blocks")
+    out, at = [], 0
+    for n in need:
+        out.append(perm[at : at + n].tolist())
+        at += n
+    return out
+
+
+def poison_unread(kv, block_table, seq_lens, *, window: bool, rows=None):
+    """NaN into every byte of ``kv`` (in place) that row t's attention must not
+    read: its keys below ``lo`` and at or past ``L`` on the pages it reads
+    (the first window page's head, the last page's tail, in K and V), and the
+    whole of its table's pages wholly below the window. Rows' pages must be
+    distinct (``assign_pages``). Returns ``kv``."""
+    rows = range(block_table.shape[0]) if rows is None else rows
+    cap = block_table.shape[1] * spec.KV_BLOCK
+    for t in rows:
+        L = min(max(int(seq_lens[t]), 0), cap)
+        if L == 0:
+            continue
+        lo, b0, nb, _, _ = spec.split_plan(L, window, 1)
+        bt = block_table[t].tolist()
+        for j in range(b0):
+            if bt[j] != 0:
+                kv[bt[j]] = math.nan
+        kv[bt[b0], :, : lo - b0 * spec.KV_BLOCK] = math.nan
+        last = b0 + nb - 1
+        kv[bt[last], :, L - last * spec.KV_BLOCK :] = math.nan
+    return kv
+
+
+class FakeMrv2:
+    """Model Runner V2's persistent per-step inputs of the kernel layers
+    (DESIGN_BC 1.5), written in place a step as MRV2 writes them, so a captured
+    graph's addresses stay valid: per KV group a block table int32 [max_reqs,
+    max_blocks] (``BlockTables.input_block_tables[g]``) and a slot-mapping row
+    (``slot_mappings`` int64 [G, max_tokens]); ``seq_lens`` int32 [max_reqs];
+    ``positions`` int64 and ``is_padding`` bool [max_tokens].
+
+    ``groups``: KV group -> its layers' names; ``sliding``: the sliding
+    groups. A sliding group's entries wholly below the window of the
+    request's first scheduled token are nulled (block 0); entries past a
+    request's last page keep what an earlier step left (``stale`` fills them
+    instead); padded rows are zeroed."""
+
+    def __init__(
+        self,
+        groups: Mapping[str, Sequence[str]],
+        sliding: Collection[str],
+        *,
+        max_reqs: int = spec.MAX_ROWS,
+        max_blocks: int = 256,
+        max_tokens: int = spec.MAX_ROWS,
+        device="cpu",
+    ):
+        self.groups = {g: tuple(names) for g, names in groups.items()}
+        self.sliding = frozenset(sliding)
+        self.block_tables = {
+            g: torch.zeros(max_reqs, max_blocks, dtype=torch.int32, device=device)
+            for g in self.groups
+        }
+        self.slot_mappings = torch.full(
+            (len(self.groups), max_tokens), PAD_SLOT, dtype=torch.int64, device=device
+        )
+        self.seq_lens = torch.zeros(max_reqs, dtype=torch.int32, device=device)
+        self.positions = torch.zeros(max_tokens, dtype=torch.int64, device=device)
+        self.is_padding = torch.ones(max_tokens, dtype=torch.bool, device=device)
+
+    def _view(self, width: int, q: int) -> SimpleNamespace:
+        reqs = width // q
+        md, sm = {}, {}
+        for gi, (g, names) in enumerate(self.groups.items()):
+            for name in names:
+                sm[name] = self.slot_mappings[gi, :width]
+                md[name] = SimpleNamespace(
+                    block_table=self.block_tables[g][:reqs],
+                    seq_lens=self.seq_lens[:reqs],
+                    slot_mapping=sm[name],
+                    decode_metadata=SimpleNamespace(max_query_len=q),
+                    num_prefills=0,
+                    num_extends=0,
+                    num_decode_tokens=width,
+                    num_decodes=reqs,
+                )
+        return SimpleNamespace(
+            width=width,
+            attn_metadata=md,
+            slot_mapping=sm,
+            positions=self.positions[:width],
+            pad=self.is_padding[:width],
+        )
+
+    def capture(self, width: int, q: int = 1) -> SimpleNamespace:
+        """A capture / dummy run: rows zeroed, ``seq_lens`` q (each dummy
+        request's query), slots ``PAD_SLOT``, positions 0, every row padding."""
+        reqs = width // q
+        for bt in self.block_tables.values():
+            bt[:reqs].zero_()
+        self.slot_mappings.fill_(PAD_SLOT)
+        self.seq_lens.zero_()
+        self.seq_lens[:reqs] = q
+        self.positions[:width].zero_()
+        self.is_padding[:width].fill_(True)
+        return self._view(width, q)
+
+    def step(
+        self,
+        seq_lens: Sequence[int],
+        pages: Mapping[str, Sequence[Sequence[int]]],
+        width: int,
+        q: int = 1,
+        *,
+        stale: int | None = None,
+    ) -> SimpleNamespace:
+        """One decode (q = 1) or uniform verify step of ``len(seq_lens)``
+        requests padded to ``width`` rows. ``seq_lens[r]``: request r's context
+        including this step's q tokens; ``pages[g][r]``: its physical blocks in
+        group g, page order. Returns the step's view: ``attn_metadata`` and
+        ``slot_mapping`` by layer name (slices of the persistent buffers),
+        ``positions``, ``pad``."""
+        reqs, padded = len(seq_lens), width // q
+        if padded * q != width or reqs > padded:
+            raise ValueError(f"{reqs} requests of {q} rows in a width {width}")
+        for gi, (g, bt) in enumerate(self.block_tables.items()):
+            self.slot_mappings[gi].fill_(PAD_SLOT)
+            for r in range(padded):
+                if r >= reqs:
+                    bt[r].zero_()
+                    continue
+                L = seq_lens[r]
+                n = -(-L // spec.KV_BLOCK)
+                ids = list(pages[g][r][:n])
+                if g in self.sliding:  # block_table.py: num_computed_tokens - reach
+                    null = max(L - q - (spec.WINDOW - 1), 0) // spec.KV_BLOCK
+                    ids[:null] = [0] * null
+                bt[r, :n] = torch.tensor(ids, dtype=torch.int32)
+                if stale is not None:
+                    bt[r, n:] = stale
+                for i in range(q):
+                    pos = L - q + i
+                    blk = pages[g][r][pos // spec.KV_BLOCK]
+                    self.slot_mappings[gi, r * q + i] = (
+                        blk * spec.KV_BLOCK + pos % spec.KV_BLOCK
+                    )
+        self.seq_lens.zero_()
+        self.seq_lens[:reqs] = torch.tensor(seq_lens, dtype=torch.int32)
+        self.positions[:width].zero_()
+        self.is_padding[:width].fill_(True)
+        for r, L in enumerate(seq_lens):
+            self.positions[r * q : (r + 1) * q] = torch.arange(L - q, L)
+            self.is_padding[r * q : (r + 1) * q] = False
+        return self._view(width, q)

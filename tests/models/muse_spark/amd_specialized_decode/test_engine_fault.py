@@ -9,7 +9,13 @@ The model is the real checkpoint's config cut to 4 layers with dummy weights:
 layer 0 keeps BF16 experts (Quark's ``exclude``), layers 1..3 are kernel
 layers. ``--load-format dummy`` never calls ``load_weights``, so this also
 covers the residual-constant materialization in
-``process_weights_after_loading``."""
+``process_weights_after_loading``.
+
+Two stalls: K2 of the step's first kernel layer (Phase A), and K1 of that layer
+with Phase B1's front on (``additional_config`` "mono_front": "k1"; the stock
+attention core and K2's Phase A core keep the variant independent of B2 / C):
+its waits are rank-local, so the other ranks give up in the K2 that waits on
+the stalled rank's all-reduce partials."""
 
 import json
 import os
@@ -27,7 +33,13 @@ MODEL_ID = "amd/Muse-Spark-Open-816B-A42B-Quark-MXFP4"
 MODEL = os.environ.get("MUSE_SPARK_MODEL", MODEL_ID)
 STALLED = 3
 FAULT_EPOCH = 256  # a served step well past the self-test, warm-ups and capture
-FAULT_SLOT = 128 + 1  # spec.k2_slot(1): the step's first K2 launch
+# (the runner's fault attribute, the stalled launch's slot, additional_config):
+# the step's first K2 launch (spec.k2_slot(1)) or the step's first K1 launch
+# (spec.k1_slot(1)), which runs right after the epoch bump
+FAULTS = {
+    "k2": ("fault", 128 + 1, {}),
+    "k1": ("fault_k1", 1, {"mono_front": "k1"}),
+}
 STARTUP_TIMEOUT = 1800
 FAULT_DEADLINE = 900
 EXIT_TIMEOUT = 300
@@ -47,10 +59,11 @@ def _on_gfx950() -> bool:
 
 needs_gfx950 = pytest.mark.skipif(not _on_gfx950(), reason="needs MI355X (gfx950)")
 
-# Builds every rank's K2 with the fault hook (``K2Build.fault_*``): rank STALLED
-# stalls past every in-kernel wait's budget in the launch of slot FAULT_SLOT at
-# epoch FAULT_EPOCH. Patched into ``MonoRunner.fault`` as the runner module
-# loads, in every vLLM process. ``SpecializedDecode.after_capture`` (the end of
+# Builds every rank's K2 (or K1) with the fault hook (``K2Build.fault_*``,
+# ``K1Build.fault_*``): rank STALLED stalls past every in-kernel wait's budget in
+# the launch of its slot (FAULTS) at epoch FAULT_EPOCH. Patched into
+# ``MonoRunner.fault`` (``fault_k1``) as the runner module loads, in every vLLM
+# process. ``SpecializedDecode.after_capture`` (the end of
 # the startup) also appends the rank's device epoch to EPOCHS, so the test can
 # tell a fault that fired during the startup from a lost one; ``FailStop``'s
 # stop appends "rank epoch" to STOPS before it raises, so the test can tell the
@@ -74,7 +87,7 @@ def _patch_runner(module):
             "fault_ticks": {ticks},
         }}
 
-    module.MonoRunner.fault = property(fault, lambda runner, value: None)
+    module.MonoRunner.{attr} = property(fault, lambda runner, value: None)
 
 
 def _patch_decode(module):
@@ -171,20 +184,23 @@ SERVER_ARGS = [
 
 @needs_gfx950
 @multi_gpu_test(num_gpus=8)
-def test_a_stalled_rank_stops_the_engine(tmp_path):
+@pytest.mark.parametrize("kernel", list(FAULTS))
+def test_a_stalled_rank_stops_the_engine(tmp_path, kernel):
     from vllm.models.muse_spark.amd.specialized_decode.mono.common.sync import (
         WAIT_TICKS,
     )
 
+    attr, fault_slot, extra = FAULTS[kernel]
     site = tmp_path / "mono_fault"
     site.mkdir()
     epochs = tmp_path / "epochs.txt"
     stops = tmp_path / "stops.txt"
     (site / "sitecustomize.py").write_text(
         _SITECUSTOMIZE.format(
+            attr=attr,
             rank=STALLED,
             epoch=FAULT_EPOCH,
-            slot=FAULT_SLOT,
+            slot=fault_slot,
             ticks=WAIT_TICKS * 3 // 2,
             epochs=str(epochs),
             stops=str(stops),
@@ -205,8 +221,11 @@ def test_a_stalled_rank_stops_the_engine(tmp_path):
         "temperature": 0,
         "ignore_eos": True,
     }
+    args = SERVER_ARGS
+    if extra:
+        args = [*args, "--additional-config", json.dumps(extra)]
     with RemoteOpenAIServer(
-        MODEL, SERVER_ARGS, env_dict=env, max_wait_seconds=STARTUP_TIMEOUT
+        MODEL, args, env_dict=env, max_wait_seconds=STARTUP_TIMEOUT
     ) as server:
         # the startup ended (after_capture on every rank) below the fault's step
         ready = [int(e) for e in epochs.read_text().split()] if epochs.exists() else []
@@ -244,3 +263,31 @@ def test_a_stalled_rank_stops_the_engine(tmp_path):
     seen = {int(r): int(e) for r, e in zip(lines[::2], lines[1::2])}
     assert sorted(seen) == list(range(8)), f"FailStop stopped ranks {sorted(seen)}"
     assert all(e >= FAULT_EPOCH for e in seen.values()), seen
+
+
+@pytest.mark.parametrize("kernel", list(FAULTS))
+def test_fault_hook_renders(tmp_path, kernel):
+    """CPU: the injected sitecustomize of each variant is valid Python that
+    patches the runner attribute its build key reads, with a fault slot the key
+    accepts (``K1Build`` / ``K2Build`` validate it)."""
+    from vllm.models.muse_spark.amd.specialized_decode.mono import spec
+
+    attr, fault_slot, extra = FAULTS[kernel]
+    code = _SITECUSTOMIZE.format(
+        attr=attr,
+        rank=STALLED,
+        epoch=FAULT_EPOCH,
+        slot=fault_slot,
+        ticks=7,
+        epochs=str(tmp_path / "e"),
+        stops=str(tmp_path / "s"),
+    )
+    compile(code, "sitecustomize.py", "exec")
+    assert f"module.MonoRunner.{attr} = property(" in code
+    fault = dict(fault_rank=STALLED, fault_epoch=FAULT_EPOCH, fault_slot=fault_slot)
+    if kernel == "k1":
+        spec.K1Build(tokens=1, rope=False, fault_ticks=7, **fault)
+        assert fault_slot == spec.k1_slot(1) and extra == {"mono_front": "k1"}
+    else:
+        spec.K2Build(tokens=1, fault_ticks=7, **fault)
+        assert fault_slot == spec.k2_slot(1) and extra == {}

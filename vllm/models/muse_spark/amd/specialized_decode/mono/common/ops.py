@@ -18,8 +18,8 @@ Raw boundaries kept, for want of an equivalent on the pinned FlyDSL:
 ``buffer_ops`` loads / stores (the kernels take raw Int64 addresses, no tensors
 for ``make_buffer_tensor``); raw MFMA intrinsics (hand-laid operands: permlane
 transposes, fp8 packing, MXFP4 scales); the LLVM intrinsics here (``expect``,
-``s_memrealtime``, the approximate rsq / rcp / exp2) and the struct unpacking of
-``permlane*_swap``.
+``s_memrealtime``, the approximate rsq / rcp / exp2, the raw sqrt) and the
+struct unpacking of ``permlane*_swap``.
 """
 
 from __future__ import annotations
@@ -143,6 +143,13 @@ def hw_rsq(x):
     return _hw_f32("llvm.amdgcn.rsq.f32", x)
 
 
+def hw_sqrt(x):
+    """v_sqrt_f32, raw: no denormal range scaling and no correction step
+    (``fmath.sqrt`` gets both). The FLA gated norm's ``tl.sqrt`` on gfx950
+    (DESIGN_BC 1.4)."""
+    return _hw_f32("llvm.amdgcn.sqrt.f32", x)
+
+
 def hw_rcp(x):
     return _hw_f32("llvm.amdgcn.rcp.f32", x)
 
@@ -254,6 +261,43 @@ def row_shr(v, lane, k):
     """DPP row_shr:k of an f32: lane - k of the same 16-lane row, else 0."""
     moved = lane_gather(v.bitcast(fx.Int32), fx.max(lane - k, 0)).bitcast(fx.Float32)
     return fx.Float32((lane % 16 >= k).select(moved, fx.Float32(0.0)))
+
+
+def _shr_dpp(v, k):
+    """DPP row_shr:k of an f32 as one VALU move: lane - k of the same 16-lane
+    row, 0 in the row's first k lanes."""
+    y = update_dpp_i32(fx.Int32(0), v.bitcast(fx.Int32), 0x110 + k, 0xF, 0xF, True)
+    return fx.Int32(y).bitcast(fx.Float32)
+
+
+def seq8_sum(sq, lane):
+    """A head's sum of squares in the fused QK-norm insert's order (DESIGN_BC
+    1.3 steps 2-3), a dim a lane, ``sq`` = RN(x^2): each 8-dim chunk's serial
+    chain p_k = p_{k-1} + sq_k (lane 8 li + k), then the chunks summed as the
+    .cu's ``shfl_xor`` 4, 2, 1 tree, here over lanes ^ 32, ^ 16, ^ 8 (the same
+    sums up to commutation). Wave-uniform; every lane of the wave must be
+    active (DPP and readlane see no masked-off lane's value)."""
+    k8 = lane % 8
+    v = sq
+    for k in range(1, 8):
+        v = fx.Float32((k8 == k).select(_shr_dpp(v, 1) + sq, v))
+    return readlane(butterfly(v, (32, 16, 8)), 63)
+
+
+def tl_sum64(x, lane=None):
+    """Sum of x^2 over a 64-lane row (lane = column) in the order of the FLA
+    gated norm's ``tl.sum(x * x)`` as served: Triton 3.8's gfx950 instance
+    that ``rms_norm_gated`` runs (the runtime specialization, pointers
+    divisible by 16 and in buffer range, DESIGN_BC 1.4). That instance lays a
+    row over 32 lanes, two adjacent columns a lane: the leaf is s_c =
+    RN(x_2c^2) + RN(x_2c+1^2) (``v_pk_mul_f32`` then ``v_add_f32``, no fma),
+    then the 32-lane butterfly xor 16, 8, 4, 2, 1 (``v_permlane16_swap``,
+    row_ror 8, row_half_mirror / quad_perm). Here a column a lane: the leaf
+    over lanes ^ 1, then the same pairs over lanes ^ 32, 16, 8, 4, 2. Every
+    add is of the same two values (IEEE adds commute), so the sum is the
+    stock one bit for bit. Every lane gets it; every lane of the wave must
+    be active. ``lane``: unused."""
+    return butterfly(x * x, (1, 32, 16, 8, 4, 2))
 
 
 def _xpartner(v, off, lane):

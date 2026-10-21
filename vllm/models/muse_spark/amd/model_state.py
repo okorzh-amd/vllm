@@ -29,8 +29,9 @@ class MuseSparkModelState(DefaultModelState):
         super().initialize_kv_cache(kv_cache_config, block_tables)
         decode = self._decode()
         if decode is not None:
-            # stage 3 and the startup self-test, at every bind
-            decode.prepare_kv()
+            # stage 3 and the startup self-test, at every bind; MRV2's
+            # persistent block tables pin the kernels' metadata addresses
+            decode.prepare_kv(kv_cache_config, block_tables)
 
     def capture_inner_cudagraphs(self, *args, **kwargs):
         super().capture_inner_cudagraphs(*args, **kwargs)

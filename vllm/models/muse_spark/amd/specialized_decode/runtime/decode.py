@@ -10,7 +10,16 @@ and graph capture. ``prepare_kv`` binds it to every KV cache vLLM allocates and
 runs a startup self-test of every build; ``after_capture`` votes on the capture
 warm-ups and tightens the in-kernel wait budget. Each step ``plan`` returns a
 ``Step`` or None; ``Step.layer(i)`` is the kernel replacing decoder layer i
-(None for vLLM's layers). Weight reloads are not supported."""
+(None for vLLM's layers). Weight reloads are not supported.
+
+Phases B and C (``layers.Phases``, ``additional_config`` "mono_front" /
+"mono_core") add kernels that read the KV caches and the per-step metadata
+(slot mappings, block tables, sequence lengths, positions, the pad mask): those
+must be MRV2's persistent buffers, since a FULL graph bakes their addresses
+into its launches. ``plan`` checks that every step passes the addresses the
+first one (or the KV bind, given MRV2's block tables) did; the first ``plan``
+of each FULL graph runs at its capture, so a builder that broke the invariant
+stops the startup."""
 
 from collections.abc import Callable, Mapping
 from functools import partial
@@ -28,6 +37,7 @@ from vllm.models.muse_spark.amd.specialized_decode.mono.abi import (
     STARTUP_WAIT_SECONDS,
     WAIT_SECONDS,
 )
+from vllm.models.muse_spark.amd.specialized_decode.mono.spec import K2Build
 from vllm.models.muse_spark.amd.specialized_decode.runtime import HINT, DecodeConfig
 from vllm.models.muse_spark.amd.specialized_decode.runtime.guards import (
     FailStop,
@@ -38,7 +48,9 @@ from vllm.models.muse_spark.amd.specialized_decode.runtime.guards import (
 from vllm.models.muse_spark.amd.specialized_decode.runtime.layers import (
     KernelLayer,
     compile_build,
-    k2_launch,
+    decode_phases,
+    self_test_step,
+    table_rows,
 )
 from vllm.models.muse_spark.amd.specialized_decode.runtime.peer import tp_agree
 from vllm.models.muse_spark.amd.specialized_decode.runtime.runner import MonoRunner
@@ -51,7 +63,7 @@ class Step(NamedTuple):
     requests."""
 
     width: int
-    attn_metadata: Mapping[str, Any]  # by layer name
+    attn_metadata: Mapping[str, Any]  # by layer name (the split core's tables)
     slot_mapping: Mapping[str, torch.Tensor]  # by layer name (Phase B's K1)
     kernels: Mapping[int, KernelLayer]  # by decoder layer, at this width
     pad: torch.Tensor  # bool/uint8 [>= width], device, graph-stable
@@ -112,15 +124,29 @@ class SpecializedDecode:
     plans every step."""
 
     def __init__(self, backbone, config: DecodeConfig, vllm_config=None):
-        tp = get_tp_group()
-        layers = kernel_layers(backbone)
-        agree(refuse_model(backbone, layers), tp.cpu_group, "the loaded weights")
         if vllm_config is None:
             from vllm.config import get_current_vllm_config
 
             vllm_config = get_current_vllm_config()
+        # the same config on every rank: raises on all of them alike
+        phases = self.phases = decode_phases(vllm_config)
+        tp = get_tp_group()
+        core = phases.k2_core(config.q)
+        layers = kernel_layers(backbone)
+        agree(
+            refuse_model(
+                backbone,
+                layers,
+                phases.front,
+                core,
+                getattr(vllm_config.model_config, "max_model_len", None),
+            ),
+            tp.cpu_group,
+            "the loaded weights",
+        )
         self.backbone, self.config, self.layers = backbone, config, layers
         self.vllm_config = vllm_config
+        self.reads_kv = phases.reads_kv(config.q)
         runner = self.runner = MonoRunner(next(backbone.parameters()).device)
         runner.first_layer = min(layers)
         L = backbone.layers
@@ -134,9 +160,13 @@ class SpecializedDecode:
             kind: L[i].self_attn.attn.layer_name for kind, i in self.first.items()
         }
         self.kernels: dict[int, dict[int, KernelLayer]] = {
-            w: {i: KernelLayer(L[i], L[i - 1], runner, w) for i in sorted(layers)}
+            w: {
+                i: KernelLayer(L[i], L[i - 1], runner, w, layers[i], config.q, phases)
+                for i in sorted(layers)
+            }
             for w in config.widths
         }
+        # by width, K1's before K2's
         builds = sorted(
             {
                 b
@@ -144,7 +174,7 @@ class SpecializedDecode:
                 for k in by.values()
                 for b in k.builds()
             },
-            key=lambda b: b.tokens,
+            key=lambda b: (b.tokens, isinstance(b, K2Build), b.kernel_name()),
         )
         # before memory profiling and capture; agreed, so a rank that cannot
         # compile stops every rank
@@ -167,14 +197,23 @@ class SpecializedDecode:
         )
         # (data_ptr, shape, stride) of each KV kind's cache prepare_kv bound
         self._kv: tuple | None = None
+        # the persistent metadata buffers' addresses (_check_metadata): by
+        # kernel layer name (block table, its row stride, slot mapping), and
+        # the step's (seq_lens, positions, pad)
+        self._tables: dict[str, tuple[int, int, int]] = {}
+        self._step_ptrs: tuple[int, int, int] | None = None
         logger.info(
             "Muse Spark specialized decode: %d kernel layers (%d..%d), widths %s, "
-            "%d builds; other steps run vLLM's decode",
+            "%d builds (front %s from width %d, K2 core %s); other steps run "
+            "vLLM's decode",
             len(layers),
             min(layers),
             max(layers),
             list(config.widths),
             len(builds),
+            phases.front,
+            phases.k1_min_width,
+            core,
         )
 
     def _kv_key(self) -> tuple | None:
@@ -188,21 +227,32 @@ class SpecializedDecode:
             key.append((kv.data_ptr(), tuple(kv.shape), kv.stride()))
         return tuple(key)
 
-    def prepare_kv(self) -> None:
+    def prepare_kv(self, kv_cache_config=None, block_tables=None) -> None:
         """From ``MuseSparkModelState.initialize_kv_cache``, at every bind (the
         CUDA-graph memory-profiling cache, then the real one): checks the caches,
         binds them, raises the wait budget until the capture ends and runs the
-        startup self-test."""
+        startup self-test. ``kv_cache_config`` and MRV2's ``BlockTables``, when
+        given, pin each kernel layer's block table and slot mapping to its KV
+        group's persistent buffers; else the first ``plan`` records them."""
         self._kv = None
         key = self._kv_key()
         if key is None:
             return
         group = get_tp_group().cpu_group
-        agree(
-            refuse_caches(self.backbone, self.layers, self.vllm_config),
-            group,
-            "the KV caches",
+        reasons = refuse_caches(
+            self.backbone, self.layers, self.vllm_config, self.reads_kv
         )
+        if not reasons:
+            # in the same vote: a rank whose bind raised alone would leave the
+            # others in the self-test's mailboxes
+            for by in self.kernels.values():
+                for kernel in by.values():
+                    try:
+                        kernel.bind_kv()
+                    except RuntimeError as err:
+                        reasons.append(str(err))
+        agree(reasons, group, "the KV caches")
+        self._bind_tables(kv_cache_config, block_tables)
         self._kv = key
         self.runner.set_wait_budget(STARTUP_WAIT_SECONDS)
         self.self_test()
@@ -212,49 +262,35 @@ class SpecializedDecode:
 
     def self_test(self) -> None:
         """Collective, outside any capture, on every TP rank: for every width two
-        steps, each one launch of every distinct build at that width (the first
-        kernel layer's weights) on a zero core and stream: (a) every row a pad row
-        (no expert in the union: a capture warm-up's step), (b) no pad row (every
-        stage live). The ranks then agree that none gave up a wait and that every
-        output is finite (and zero in (a)). This also loads every code object
-        before any capture (``compile_build`` only compiles)."""
+        steps, (a) every row a pad row (no expert in the union: a capture
+        warm-up's step), (b) no pad row (every stage live). A step launches the
+        builds of each KV kind's first kernel layer ([K1], then K2;
+        ``layers.self_test_step``) on a zero stream and branch: the first
+        kernel layer of each distinct list of builds, so a kind whose builds an
+        earlier kind ran is skipped (Phase A builds no kind apart). The ranks
+        then agree that none gave up a wait and that every output is finite
+        (and zero in (a)). This also loads every code object before any capture
+        (``compile_build`` only compiles). It reads only each kernel layer's
+        launch contract (``builds``, ``static``, ``static_k1``)."""
         runner = self.runner
-        device = runner.scratch.device
-        kernels = {w: by[min(by)] for w, by in self.kernels.items()}
         outputs = []
-        for w, kernel in kernels.items():
-            core = torch.zeros(w, spec.CORE, dtype=torch.bfloat16, device=device)
-            stream = torch.zeros(w, spec.HIDDEN, dtype=torch.float32, device=device)
+        for w, by in self.kernels.items():
+            tested: dict[tuple, KernelLayer] = {}
+            for i in sorted(by):
+                tested.setdefault(tuple(by[i].builds()), by[i])
             for all_pad in (True, False):
                 pad = torch.full_like(runner.no_pad, int(all_pad))
-                stream_out = torch.empty_like(stream)
-                branch_out = torch.empty(
-                    w, spec.HIDDEN, dtype=torch.bfloat16, device=device
-                )
                 runner.step_begin()
-                for build in dict.fromkeys(kernel.builds()):
-                    k2_launch(
-                        build,
-                        {
-                            **kernel.static,
-                            "core": core,
-                            "stream": stream,
-                            "pad": pad,
-                            "stream_out": stream_out,
-                            "branch_out": branch_out,
-                        },
-                    )
-                outputs.append((w, all_pad, stream_out, branch_out))
+                for kernel in tested.values():
+                    for out in self_test_step(kernel, pad, live=not all_pad):
+                        outputs.append((w, all_pad, out))
         torch.accelerator.synchronize()
         reasons = _health_reasons(runner)
-        for w, all_pad, *outs in outputs:
-            for out in outs:
-                if not bool(torch.isfinite(out).all()):
-                    reasons.append(
-                        f"rank {runner.rank}: width {w} gave non-finite rows"
-                    )
-                elif all_pad and bool(out.any()):
-                    reasons.append(f"rank {runner.rank}: width {w} pad rows not zero")
+        for w, all_pad, out in outputs:
+            if not bool(torch.isfinite(out).all()):
+                reasons.append(f"rank {runner.rank}: width {w} gave non-finite rows")
+            elif all_pad and bool(out.any()):
+                reasons.append(f"rank {runner.rank}: width {w} pad rows not zero")
         agree(reasons, get_tp_group().cpu_group, "the startup self-test")
 
     def after_capture(self) -> None:
@@ -357,13 +393,109 @@ class SpecializedDecode:
         # otherwise); captures and warm-ups fill it all True.
         pad = ctx.is_padding if ctx.is_padding is not None else self.runner.no_pad
         # step_reason accepted md: one step's dicts (not DBO's lists)
-        return Step(
+        step = Step(
             width,
             cast(Mapping[str, Any], md),
             cast(Mapping[str, torch.Tensor], ctx.slot_mapping),
             kernels,
             pad,
         )
+        if self.reads_kv:
+            self._check_metadata(step, positions)
+        return step
+
+    def _bind_tables(self, kv_cache_config, block_tables) -> None:
+        """At a KV bind: forgets the recorded metadata addresses and, given
+        MRV2's handles, records each kernel layer's KV group's persistent block
+        table (``BlockTables.input_block_tables[g]``) and slot mapping
+        (``slot_mappings[g]``), checked like a step's (``_table_record``)."""
+        self._tables, self._step_ptrs = {}, None
+        if not self.reads_kv or block_tables is None:
+            return
+        groups = {
+            name: g
+            for g, kv_group in enumerate(kv_cache_config.kv_cache_groups)
+            for name in kv_group.layer_names
+        }
+        for i in sorted(self.layers):
+            name = self.backbone.layers[i].self_attn.attn.layer_name
+            g = groups.get(name)
+            if g is None:
+                raise RuntimeError(
+                    f"Muse Spark specialized decode: layer {i} ({name}) is in no "
+                    "KV cache group"
+                )
+            self._tables[name] = self._table_record(
+                name,
+                block_tables.input_block_tables[g],
+                block_tables.slot_mappings[g],
+            )
+
+    def _table_record(
+        self, name: str, block_table: torch.Tensor, slots: torch.Tensor
+    ) -> tuple[int, int, int]:
+        """(block table address, its row stride, slot mapping address) after
+        checking what the kernels assume: an int32 table, dense in a row, whose
+        buffer holds a row a request, and int64 slots. Raises: an MRV2
+        invariant, not a refusal."""
+        rows = table_rows(block_table)
+        max_reqs = self.vllm_config.scheduler_config.max_num_seqs
+        if (
+            block_table.dtype != torch.int32
+            or block_table.ndim != 2
+            or block_table.stride(1) != 1
+            or rows < max_reqs
+        ):
+            raise RuntimeError(
+                f"Muse Spark specialized decode: {name}'s block table "
+                f"{block_table.dtype} {tuple(block_table.shape)} stride "
+                f"{block_table.stride()} over {rows} rows (int32, dense rows, "
+                f">= {max_reqs} of them)"
+            )
+        if slots.dtype != torch.int64:
+            raise RuntimeError(
+                f"Muse Spark specialized decode: {name}'s slot mapping "
+                f"{slots.dtype} (int64)"
+            )
+        return block_table.data_ptr(), block_table.stride(0), slots.data_ptr()
+
+    def _check_metadata(self, step: Step, positions: torch.Tensor) -> None:
+        """Host only, no device sync: every kernel layer's block table, slot
+        mapping and the step's sequence lengths, positions and pad mask are the
+        persistent buffers the first step (or the bind) recorded. A FULL graph
+        replays the addresses its capture baked in; a builder handing out
+        another buffer would make the kernels read stale metadata."""
+        ptrs = (positions.data_ptr(), step.pad.data_ptr())
+        for i in sorted(self.layers):
+            name = self.backbone.layers[i].self_attn.attn.layer_name
+            md: Any = step.attn_metadata.get(name)
+            slots = step.slot_mapping.get(name)
+            if md is None or slots is None:
+                raise RuntimeError(
+                    f"Muse Spark specialized decode: no metadata / slot mapping "
+                    f"for {name}"
+                )
+            bt, seq_lens = md.block_table, md.seq_lens
+            want = self._tables.get(name)
+            if want is None:
+                self._tables[name] = self._table_record(name, bt, slots)
+            elif (bt.data_ptr(), bt.stride(0), slots.data_ptr()) != want:
+                raise RuntimeError(
+                    f"Muse Spark specialized decode: {name}'s block table / slot "
+                    "mapping moved off MRV2's persistent buffers"
+                )
+            if self._step_ptrs is None:
+                if seq_lens.dtype != torch.int32 or positions.dtype != torch.int64:
+                    raise RuntimeError(
+                        f"Muse Spark specialized decode: seq_lens {seq_lens.dtype} "
+                        f"(int32), positions {positions.dtype} (int64)"
+                    )
+                self._step_ptrs = (seq_lens.data_ptr(), *ptrs)
+            if (seq_lens.data_ptr(), *ptrs) != self._step_ptrs:
+                raise RuntimeError(
+                    "Muse Spark specialized decode: the step's seq_lens / positions "
+                    "/ pad mask moved off MRV2's persistent buffers"
+                )
 
     def after_step(self) -> None:
         """Once per executed step, from compute_logits (eager on every rank, also
