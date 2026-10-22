@@ -199,17 +199,18 @@
    "sha256": "82ad2a9b8f2a9cf7abecca23dbba243d36aa884691fafe0ae99ac36f4693035e"
   }
  },
- "image": "muse-mono-dev:df3bd094 (sha256:8fefa1bded29d5e9314f3aacb121c88bc9e31db63d75120163e984a67fff8b6c)",
+ "image": "muse-mono-dev:df6603f0 (sha256:8da858be152fbbd861c3aefb7cae6d2d0d99a099b79245c84e297c2420c42662)",
  "procedure": [
   "The Phase A K2 builds' final ISA (DESIGN_BC 9.1), recorded BEFORE any Phase B / C kernel edit; test_compile.py::test_k2_tensor_isa_unchanged compares every core='tensor' build with it.",
   "Digest: sha256 of the build's *final_isa.s (FLYDSL_DUMP_IR) with every whole-word occurrence of its kernel symbol replaced by '<kernel>' (test_compile.isa_digest).",
   "Compile: GPU-less, COMPILE_ONLY=1 FLYDSL_RUNTIME_ENABLE_CACHE=0 FLYDSL_DUMP_IR=1 FLYDSL_GPU_ARCH=gfx950 ARCH=gfx950, layer.build(key)(*layer.ABI.zeros()) for each of test_compile.BUILDS (widths 1..8, the two fault builds, the S=8 debug build). Deterministic: two runs, same hashes.",
   "Recorded 2026-10-20 from a clean checkout of okorzh/muse-spark-amd-mono at ca9640e2e2 (git status empty), in muse-mono-dev:df3bd094 via /home/okorzh/muse-mono/bin/cpu_bc.sh; the resources equal the Phase A STATUS compile table.",
-  "Regenerate ONLY when the toolchain changes (the test skips while 'toolchain' differs from the image's) and ONLY from the Phase A K2 sources: a tree whose vllm/models/muse_spark/amd/specialized_decode/mono/ is ca9640e2e2's (git worktree add <dir> ca9640e2e2, plus the image's compiled vllm/*.so as bin/cpu_bc.sh mounts them), with this test_compile.py copied in: python3 tests/models/muse_spark/amd_specialized_decode/test_compile.py --write-baseline <source> <image>. Never regenerate from a tree with B / C kernel edits: the test would then pass vacuously."
+  "Regenerate ONLY when the toolchain changes (the test skips while 'toolchain' differs from the image's) and ONLY from the Phase A K2 sources: a tree whose vllm/models/muse_spark/amd/specialized_decode/mono/ is ca9640e2e2's (git worktree add <dir> ca9640e2e2, plus the image's compiled vllm/*.so as bin/cpu_bc.sh mounts them), with this test_compile.py copied in: python3 tests/models/muse_spark/amd_specialized_decode/test_compile.py --write-baseline <source> <image>. Never regenerate from a tree with B / C kernel edits: the test would then pass vacuously.",
+  "Re-recorded 2026-10-22 for the toolchain bump (FlyDSL 0.3.4.1 -> 0.4.0, AITER 0.1.25 -> 0.1.26; vLLM main fdc5fde9d7, nightly df6603f0) from the rebased Phase A commit 72317cfba9, whose mono/ kernel sources equal ca9640e2e2's: this test_compile.py no longer imports there (it needs Phase B's spec.K1Build and test_probe_qkv), so its BUILDS, _isa, isa_digest, toolchain and _write_baseline ran verbatim against the Phase A modules; two runs, same hashes, and every digest and resource equals the 0.3.4.1 record, so only 'toolchain', 'source' and 'image' changed."
  ],
- "source": "okorzh/muse-spark-amd-mono ca9640e2e2 (clean)",
+ "source": "okorzh/muse-spark-amd-mono-main 72317cfba9 (the rebased Phase A commit, clean)",
  "toolchain": {
-  "amd-aiter": "0.1.25",
-  "flydsl": "0.3.4.1"
+  "amd-aiter": "0.1.26",
+  "flydsl": "0.4.0"
  }
 }
