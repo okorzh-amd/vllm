@@ -296,6 +296,9 @@ def make_context(
         scr[r] = sreg(scratch, lay[r][0], r)
     for r, _, _ in spec.SCRATCH_PLAIN_BC:
         scr[r] = scratch + fx.Int64(lay[r][0])
+    # tuning variants' mailboxes, past every plain region
+    for r in spec.SCRATCH_REGIONS_TAIL:
+        scr[r] = sreg(scratch, lay[r][0], r)
     return {
         "S": S,
         "tid": tid,

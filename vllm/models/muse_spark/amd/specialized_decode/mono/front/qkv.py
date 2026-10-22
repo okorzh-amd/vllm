@@ -38,12 +38,19 @@ CTA, ~8 us, the boundary ~2-3 us); it publishes nothing.
 the staging pass and the task sums are here. The task map is M2's ``g192``
 weight-stream probe (``test_probe_m2.py``), whose ``staged`` variant is
 this stage's B operand path.
+
+Opt-in variant (``K1Build.layout``): "r256", M2's 10/6 rebalance
+(``spec.K1_ROLES``): ``Tasks`` roles of 6 tasks on each boundary CTA and 10 on
+each GEMV CTA; a tile has 2 to 4 contributors, whose partials go to ``qpart4``
+(``spec.k1_qpart_pair``). ``k1.program_roles`` issues a boundary CTA's weights
+after its slice's publish (rule 8: its boundary polls hold no weight).
 """
 
 import functools
+from dataclasses import dataclass
 
 import flydsl.expr as fx
-from flydsl.expr import gpu, range_constexpr, rocdl
+from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 
 from vllm.models.muse_spark.amd.specialized_decode.mono.common.ops import (
     ld_dev,
@@ -61,6 +68,9 @@ from vllm.models.muse_spark.amd.specialized_decode.mono.spec import (
     COLS,
     HIDDEN,
     K1_MAXC,
+    K1_MAXC_BY_LAYOUT,
+    K1_QPART,
+    K1_ROLES,
     K1_ROUNDS,
     K1_TPC,
     KPART,
@@ -69,12 +79,14 @@ from vllm.models.muse_spark.amd.specialized_decode.mono.spec import (
     WAVES,
     ardy_pair,
     k1_contributor0,
+    k1_qpart_pair,
     qpart_pair,
 )
 from vllm.models.muse_spark.amd.specialized_decode.mono.stages import gemv
 
 STAGE = "qkv"
-STAGE_REGIONS = ("ardy", "qpart")  # polls ardy; puts qpart (the epilogue polls)
+# polls ardy; puts its layout's partials region (the epilogue polls)
+STAGE_REGIONS = ("ardy", "qpart", "qpart4")
 
 XA_ROW = KPART + gemv.LDS_PAD  # bf16 a padded LDS K part row (520)
 X4 = KPART // 8  # dwordx4 a K part row (64)
@@ -84,54 +96,98 @@ assert CHUNKS * 2 == WAVES and K1_ROUNDS * 2 == K1_TPC
 assert SLICES * K1_TPC <= THREADS  # a flag a polling thread
 
 
+@dataclass(frozen=True)
+class Tasks:
+    """One role of a K1 task layout (``spec.K1_ROLES``): CTAs [lo, hi), n
+    consecutive tasks a CTA from ``tau0``; CTA b's index in the role is g =
+    b - lo, its tasks tau0 + n g + i, i < n."""
+
+    layout: str
+    lo: int
+    hi: int
+    n: int
+    tau0: int
+
+    @property
+    def rounds(self) -> int:
+        return self.n // 2
+
+
+def tau_of(role: Tasks, g, i):
+    """Task i of ``role``'s CTA g (``K1_TPC * g + i`` under E3). A function,
+    not a method: FlyDSL's ``if`` rewriting carries the base of every method
+    call made in a traced branch as loop state, which a ``Tasks`` cannot be."""
+    if role.tau0 == 0:
+        return role.n * g + i
+    return role.tau0 + role.n * g + i
+
+
+def roles(layout: str) -> tuple[Tasks, ...]:
+    """The roles of ``layout``, in ``spec.K1_ROLES`` order."""
+    return tuple(Tasks(layout, *r) for r in K1_ROLES[layout])
+
+
+G192 = roles("g192")[0]  # E3: the GEMV CTAs' 12 tasks
+for _lay in K1_ROLES:
+    for _r in roles(_lay):
+        # rounds of 2; a CTA's K parts distinct; a flag a polling thread
+        assert _r.n % 2 == 0 and _r.n <= KPARTS and SLICES * _r.n <= THREADS
+        # no tile straddles two roles: contributors are role-local
+        assert _r.tau0 % KPARTS == 0 and _r.n * (_r.hi - _r.lo) % KPARTS == 0
+
+
 @functools.cache
-def lds_struct(s: int):
-    """The stage's LDS: the CTA's 12 K parts of rows 0 .. s-1 of ``arow``,
-    task i's row t at ``(i s + t) XA_ROW`` bf16 (99,840 B at s = 8). Cached:
-    one struct type a width."""
+def lds_struct(s: int, ntasks: int = K1_TPC):
+    """The stage's LDS: the CTA's ``ntasks`` K parts (12 under E3) of rows 0
+    .. s-1 of ``arow``, task i's row t at ``(i s + t) XA_ROW`` bf16 (99,840 B
+    at s = 8, 12 tasks). Cached: one struct type a width."""
 
     @fx.struct
     class QkvLds:
-        xa: fx.Array[fx.Int32, K1_TPC * s * XA_ROW // 2, 16]
+        xa: fx.Array[fx.Int32, ntasks * s * XA_ROW // 2, 16]
 
     return QkvLds
 
 
-def contributors(tile):
-    """(the first GEMV CTA g whose tasks cover ``tile``, how many do): the
-    tile's K parts are split between g (the lower ones) and g + 1. Python ints
-    (host) or traced Int32 (in-kernel) alike."""
-    return k1_contributor0(tile), K1_MAXC
+def contributors(tile, role: Tasks = G192):
+    """(the first CTA g of ``role`` whose tasks cover ``tile``, the most
+    contributors a tile of the layout has): under E3 the tile's K parts are
+    split between g (the lower ones) and g + 1. Python ints (host) or traced
+    Int32 (in-kernel) alike."""
+    if role == G192:
+        return k1_contributor0(tile), K1_MAXC
+    return (KPARTS * tile - role.tau0) // role.n, K1_MAXC_BY_LAYOUT[role.layout]
 
 
-def task(g, i):
-    """GEMV CTA g's task i: (tile T, K part kp)."""
-    tau = K1_TPC * g + i
+def task(g, i, role: Tasks = G192):
+    """CTA g of ``role``'s task i: (tile T, K part kp)."""
+    tau = tau_of(role, g, i)
     return tau // KPARTS, tau % KPARTS
 
 
-def last_of_tile(g, i):
+def last_of_tile(g, i, role: Tasks = G192):
     """Whether task i is the last of its tile in CTA g (its partial is
-    complete): i == 11, or task i + 1 starts the next tile. True (a Python
-    bool) for i == 11, else a traced Boolean (Python bool for an int g)."""
-    if i == K1_TPC - 1:
+    complete): i == n - 1, or task i + 1 starts the next tile. True (a Python
+    bool) for i == n - 1, else a traced Boolean (Python bool for an int g)."""
+    if i == role.n - 1:
         return True
-    return (K1_TPC * g + i + 1) % KPARTS == 0
+    return (tau_of(role, g, i) + 1) % KPARTS == 0
 
 
-def qkv_loads(c, g) -> list:
-    """GEMV CTA g's weights, the CTA's first loads: round r's task 2 r + h
-    (h = wave // 4), chunk wave % 4 of its K part, 4 dwordx4 a lane
-    (nontemporal), all 6 rounds in flight (96 VGPRs). A scheduling barrier
-    after them keeps every load where it is issued (LLVM would sink the late
-    rounds to their MFMAs: M2's interface note)."""
+def qkv_loads(c, g, role: Tasks = G192) -> list:
+    """CTA g of ``role``'s weights: round r's task 2 r + h (h = wave // 4),
+    chunk wave % 4 of its K part, 4 dwordx4 a lane (nontemporal), every
+    round in flight (6 under E3: 96 VGPRs). A GEMV CTA's first loads; a
+    boundary CTA's (r256) past its slice's publish. A scheduling barrier after
+    them keeps every load where it is issued (LLVM would sink the late rounds
+    to their MFMAs: M2's interface note)."""
     lane, wave = c["lane"], c["wave"]
     w4 = wave % CHUNKS
     half = wave // CHUNKS
     w = c["args"]["w_qkv"]
     ops = []
-    for r in range(K1_ROUNDS):
-        tile, kp = task(g, 2 * r + half)
+    for r in range(role.rounds):
+        tile, kp = task(g, 2 * r + half, role)
         ops.append(
             gemv.loads(lane, w4, w, tile * ROWS, KPART, ldk=HIDDEN, k0=kp * KPART)[0]
         )
@@ -144,7 +200,7 @@ def _stage_ij(v, s):
     return v // (s * X4), v // X4 % s, v % X4
 
 
-def stage_rows(c, g) -> None:
+def stage_rows(c, g, role: Tasks = G192) -> None:
     """The one staging pass: the ``arow`` rows (device scope: the boundary
     CTAs of this launch wrote them) of the CTA's 12 K parts -> LDS ``xa``, 16
     B a thread a round (12 S 64 dwordx4: 12 rounds at S = 8), every round's
@@ -159,12 +215,12 @@ def stage_rows(c, g) -> None:
     s, tid = c["S"], c["tid"]
     arow = c["scr"][AROW]
     xa = c["lds"][STAGE]["xa"]
-    total = K1_TPC * s * X4
+    total = role.n * s * X4
     vs = [fx.min(tid + THREADS * i, total - 1) for i in range(cdiv(total, THREADS))]
     got = []
     for v in vs:
         i, t, x = _stage_ij(v, s)
-        kp = (K1_TPC * g + i) % KPARTS
+        kp = tau_of(role, g, i) % KPARTS
         word = (t * HIDDEN + kp * KPART + 8 * x) // 2
         got.append(fx.Vector(ld_dev(arow, word, 4)))
     rocdl.sched_barrier(0)
@@ -175,12 +231,12 @@ def stage_rows(c, g) -> None:
 
 
 @traced
-def _poll_ardy(c, g):
-    """Thread i < 48: the ``ardy`` flag of slice 4 kp + i % 4 of the CTA's
-    task i // 4's K part kp; then a barrier."""
+def _poll_ardy(c, g, role: Tasks = G192):
+    """Thread i < 4 n (48 under E3): the ``ardy`` flag of slice 4 kp + i % 4
+    of the CTA's task i // 4's K part kp; then a barrier."""
     tid = c["tid"]
-    if tid < SLICES * K1_TPC:
-        kp = (K1_TPC * g + tid // SLICES) % KPARTS
+    if tid < SLICES * role.n:
+        kp = tau_of(role, g, tid // SLICES) % KPARTS
         c["poll"]([(c["scr"]["ardy"], ardy_pair(SLICES * kp + tid % SLICES), 1)])
     gpu.barrier()
 
@@ -208,38 +264,40 @@ def _mfmas(c, r, ops):
 
 
 @traced
-def stage_qkv(c, g, ops) -> None:
-    """GEMV CTA g: the ``ardy`` polls (its own weights in flight) -> the
-    staging pass -> 6 rounds of MFMAs; thread (t, r) = (tid // 16, tid % 16),
-    t < S, adds each task's row r of token t to the tile's partial and puts it
-    to ``qpart`` when the CTA's last task of the tile is in. Ends with a
-    barrier (``red`` and ``xa`` handed over)."""
+def stage_qkv(c, g, ops, role: Tasks = G192) -> None:
+    """CTA g of ``role``: the ``ardy`` polls (its own weights in flight) ->
+    the staging pass -> the rounds of MFMAs; thread (t, r) = (tid // 16,
+    tid % 16), t < S, adds each task's row r of token t to the tile's partial
+    and puts it to the layout's partials region when the CTA's last task of
+    the tile is in.
+    Ends with a barrier (``red`` and ``xa`` handed over)."""
     enter_stage(STAGE)
     s, tid, lane, wave, red = c["S"], c["tid"], c["lane"], c["wave"], c["red"]
-    qpart = c["scr"]["qpart"]
-    _poll_ardy(c, g)
-    stage_rows(c, g)
+    qpart = c["scr"][K1_QPART[role.layout]]
+    _poll_ardy(c, g, role)
+    stage_rows(c, g, role)
     r16 = tid % ROWS
     t = tid // ROWS
     tc = fx.min(t, s - 1)  # threads past S read token S - 1's (in bounds)
     live = t < s
     zero = fx.Float32(0.0)
     part = zero
-    for r in range_constexpr(K1_ROUNDS):
+    for r in range_constexpr(role.rounds):
         acc = _mfmas(c, r, ops[r])
         fx.ptr_store(acc, red + (wave * 64 + lane) * 4)
         gpu.barrier()
         for h in range_constexpr(2):
             i = 2 * r + h
             part = part + row_sum(red, r16, tc, range(CHUNKS * h, CHUNKS * (h + 1)))
-            tile, _ = task(g, i)
-            last = last_of_tile(g, i)
+            tile, _ = task(g, i, role)
+            last = last_of_tile(g, i, role)
             put = live if last is True else live & last
             if put:
-                c["put"](
-                    qpart,
-                    qpart_pair(tile, g - contributors(tile)[0], t, r16),
-                    part,
-                )
+                if const_expr(role == G192):
+                    pair = qpart_pair(tile, g - contributors(tile)[0], t, r16)
+                else:
+                    first = contributors(tile, role)[0]
+                    pair = k1_qpart_pair(role.layout, tile, g - first, t, r16)
+                c["put"](qpart, pair, part)
             part = zero if last is True else fx.Float32(last.select(zero, part))
         gpu.barrier()

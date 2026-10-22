@@ -229,6 +229,35 @@ def test_unit_plan_is_spec_split_plan():
                 assert got[4] <= n and (L == 0) == (got[4] == 0)
 
 
+def test_unit_plan_is_spec_split_plan_for_every_preset():
+    """TUNE L3: the kernel's ``unit_plan`` with a preset's N and MIN_PER is
+    ``spec.split_plan`` with them, at every width and kind, and every index
+    of the largest N stays in its region."""
+    Ls = set(range(0, 300)) | set(range(2000, 2120)) | set(range(4090, 4130))
+    Ls |= {32767, 32768, 32773, 65536, 131072}
+    lay = spec.scratch_layout()
+    seen = set()
+    for p in spec.SPLIT_PRESETS:
+        for S in range(1, spec.MAX_ROWS + 1):
+            for w in (False, True):
+                k = spec.K2Build(
+                    tokens=S, core="split", window=w, **spec.split_fields(p, S, w)
+                )
+                n, mp = k.nsplit(), k.split_min_per
+                last = k.n_units() - 1
+                assert 4 * (spec.pstat_word(last, J - 1, 1) + 1) <= lay[spec.PSTAT][1]
+                assert (
+                    4 * (spec.opart_word(last, J - 1, D - 1) + 1) <= lay[spec.OPART][1]
+                )
+                if (w, n, mp) in seen:
+                    continue
+                seen.add((w, n, mp))
+                for L in Ls:
+                    got = combine.unit_plan(L, w, n, mp)
+                    assert got == spec.split_plan(L, w, n, mp), (p, S, w, L)
+                    assert got[4] <= n and (L == 0) == (got[4] == 0)
+
+
 def _units(L: int, window: bool, n: int):
     """[(first key, end key)] of the units p < live: unit p covers pages [b0 +
     p per, min(b0 + (p + 1) per, b0 + nb)), keys clipped to [lo, L)."""

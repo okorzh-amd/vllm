@@ -46,6 +46,7 @@ from vllm.models.muse_spark.amd.specialized_decode.runtime.guards import (
     refuse_model,
 )
 from vllm.models.muse_spark.amd.specialized_decode.runtime.layers import (
+    SPLIT,
     KernelLayer,
     compile_build,
     decode_phases,
@@ -204,8 +205,8 @@ class SpecializedDecode:
         self._step_ptrs: tuple[int, int, int] | None = None
         logger.info(
             "Muse Spark specialized decode: %d kernel layers (%d..%d), widths %s, "
-            "%d builds (front %s from width %d, K2 core %s); other steps run "
-            "vLLM's decode",
+            "%d builds (front %s from width %d, K2 core %s, o_proj %s); other "
+            "steps run vLLM's decode",
             len(layers),
             min(layers),
             max(layers),
@@ -214,7 +215,19 @@ class SpecializedDecode:
             phases.front,
             phases.k1_min_width,
             core,
+            phases.core_oproj,
         )
+        if phases.core == SPLIT:
+            logger.info(
+                "Muse Spark specialized decode: split core presets by width 1..%d: %s",
+                spec.MAX_ROWS,
+                list(phases.split_preset),
+            )
+        if phases.k1_layout != "g192":
+            logger.info(
+                "Muse Spark specialized decode: K1 tuning variant: GEMV layout %s",
+                phases.k1_layout,
+            )
 
     def _kv_key(self) -> tuple | None:
         """(data_ptr, shape, stride) of the first kernel layer of each KV kind's

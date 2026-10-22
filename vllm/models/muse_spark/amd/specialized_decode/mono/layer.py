@@ -46,6 +46,12 @@ combine after its ``crdy``; its core load then polls ``crdy`` with only its own
 weights in flight. Only phase 1 differs between the cores; every stage from
 ``stage_o`` on is the same code.
 
+A split build's ``K2Build.oproj_issue`` (TUNE L2) places the o_proj tasks:
+"late" as above; "early" moves the combine CTAs' two tasks each onto CTAs
+below C0 (``spec.oproj_tasks``), issued with that CTA's own weights at its
+issue point, so no weight stream starts at ``crdy``; a combine CTA then skips
+phase 1 (it holds no task and needs no core rows). Same arithmetic a task.
+
 Every hand-off is a tagged pair (5.10/5.11 of the design); the tag carries the
 step epoch the runner bumps once a step and the launch's slot, so nothing is
 zeroed between launches. Every poll waits on a stage earlier in this order on
@@ -72,7 +78,7 @@ from pathlib import Path
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
-from flydsl.expr import const_expr
+from flydsl.expr import const_expr, range_constexpr
 from flydsl.expr.typing import Int32, Int64
 
 from vllm.models.muse_spark.amd.specialized_decode.mono import spec
@@ -91,6 +97,7 @@ from vllm.models.muse_spark.amd.specialized_decode.mono.common.plan import (
     THREADS,
     KernelAbi,
     key_tuple,
+    sel,
     source_digest,
 )
 from vllm.models.muse_spark.amd.specialized_decode.mono.spec import (
@@ -154,9 +161,19 @@ STAGES = (
 SPLIT_STAGES = (split.STAGE, combine.STAGE, *STAGES)
 
 
-def stages(core: str = "tensor") -> tuple[str, ...]:
-    """The program order a build of ``core`` traces."""
-    return SPLIT_STAGES if core == "split" else STAGES
+def stages(core: str = "tensor", extra: int = 0) -> tuple[str, ...]:
+    """The program order a build of ``core`` traces; ``extra``: a split
+    "early" build's extra o_proj task slots (``spec.oproj_slots``), each one
+    more ``stage_o`` after the CTA's own two."""
+    if core != "split":
+        return STAGES
+    o = SPLIT_STAGES.index("seam")
+    return (*SPLIT_STAGES[:o], *(back.STAGE,) * extra, *SPLIT_STAGES[o:])
+
+
+def key_stages(key: K2Build) -> tuple[str, ...]:
+    """The program order build ``key`` traces."""
+    return stages(key.core, key.oproj_slots())
 
 
 _STREAM = fx.Stream(None)
@@ -189,29 +206,85 @@ def lds_bytes(s: int, core: str = "tensor") -> int:
 
 
 @traced
-def split_roles(c) -> None:
+def split_roles(c, attn_out=None) -> None:
     """A split build's core stages before any o_proj weight (DESIGN_BC 7.2):
     CTA b < n_units runs split unit b, CTA b >= C0 combine b - C0 (unit
     first when both). Neither polls nor publishes with a weight in flight
     (rule 8); a CTA with no role passes straight on to its weights. Every
-    branch is CTA-uniform."""
-    s, b = c["S"], c["bid"]
-    window = split.window_of(c)
-    n, c0 = spec.n_units(s, window), spec.C0(s)
+    branch is CTA-uniform. ``attn_out`` (probes): ``combine.stage_combine``'s."""
+    b = c["bid"]
+    key = split.key_of(c)
+    n, c0 = key.n_units(), key.c0()
     if const_expr(n < BLOCKS):
         if b < n:
             split.stage_split(c, b)
     else:  # every CTA holds a unit
         split.stage_split(c, b)
     if b >= c0:
-        combine.stage_combine(c, fx.Int32(b) - c0)
+        combine.stage_combine(c, fx.Int32(b) - c0, attn_out=attn_out)
+
+
+def oproj_extra(s: int, b, j: int):
+    """Extra slot j of CTA b in a split "early" build: (held, task), Python
+    ints or traced Int32 (``sel``; the CPU tests run this very function
+    against ``spec.oproj_tasks``). The task is clamped into the moved range
+    whether held or not (a CTA that holds none masks its loads)."""
+    c0, moved = spec.C0(s), spec.oproj_moved(s)
+    half = spec.n_comb(s)
+    e = (c0 - 1 - b) + j * c0
+    held = (b < c0) & (e < moved)
+    e = sel(e < 0, 0, sel(e < moved, e, moved - 1))
+    return held, sel(e < half, c0 + e, BLOCKS + c0 + e - half)
 
 
 @traced
-def program(c, debug_dump: bool, core: str = "tensor") -> None:
+def o_proj_early_tasks(c, core: str) -> None:
+    """Phase 1 of a CTA below C0 in a split "early" build: its two tasks and
+    its extra slots' weights issued together (each extra masked to zeros,
+    no access, where the CTA holds none: one straight-line issue, no weight
+    vector crossing a region), then the core rows behind ``crdy`` (rule 8's
+    exception: the weights are this stage's), then every task it holds."""
+    s, b = c["S"], c["bid"]
+    key = split.key_of(c)
+    b32 = fx.Int32(b)
+    ops0 = back.o_loads(c, b)
+    ops1 = back.o_loads(c, b + BLOCKS)
+    held, tasks, opsx = [], [], []
+    for j in range_constexpr(key.oproj_slots()):
+        hj, tj = oproj_extra(s, b32, j)
+        size = fx.Int64(hj.select(fx.Int64(spec.W_O_BYTES), fx.Int64(0)))
+        held.append(hj)
+        tasks.append(tj)
+        opsx.append(back.o_loads(c, tj, nbytes=size))
+    back.load_core(c, core, None)
+    back.stage_o(c, b, ops0)
+    back.stage_o(c, b + BLOCKS, ops1)
+    for j in range_constexpr(len(opsx)):
+        _extra_o(c, held[j], tasks[j], opsx[j])
+
+
+@traced
+def _extra_o(c, held, task, ops) -> None:
+    """An extra slot's ``stage_o`` on the CTAs that hold it (CTA-uniform)."""
+    if held:
+        back.stage_o(c, task, ops)
+
+
+@traced
+def o_proj_early(c, core: str) -> None:
+    """Phase 1 of a split "early" build: CTAs below C0 run their tasks
+    (``o_proj_early_tasks``); a combine CTA holds none and goes on to phase 2
+    (CTA-uniform)."""
+    if fx.Int32(c["bid"]) < split.key_of(c).c0():
+        o_proj_early_tasks(c, core)
+
+
+@traced
+def program(c, debug_dump: bool, core: str = "tensor", oproj: str = "late") -> None:
     """K2's stages on CTA ``c["bid"]`` in the design's program order (5.2).
     Every call is CTA-uniform (predicated on the CTA, never on the thread), so
-    every thread reaches every barrier. ``core``: the build's (static)."""
+    every thread reaches every barrier. ``core``, ``oproj``: the build's
+    (static; ``oproj`` "early" needs the split core)."""
     s = c["S"]
     b = c["bid"]
     b32 = fx.Int32(b)
@@ -220,14 +293,17 @@ def program(c, debug_dump: bool, core: str = "tensor") -> None:
     # loads (none for "tensor" and "split": DESIGN_BC 6.2)
     if const_expr(core == "split"):
         split_roles(c)
-    # (not ``pre``: the seam's, assigned under a traced ``if`` below, must not
-    # become that branch's state)
-    core_pre = back.core_loads(c, core)
-    ops0 = back.o_loads(c, b)
-    ops1 = back.o_loads(c, b + BLOCKS)
-    back.load_core(c, core, core_pre)
-    back.stage_o(c, b, ops0)
-    back.stage_o(c, b + BLOCKS, ops1)
+    if const_expr(oproj == "early"):
+        o_proj_early(c, core)
+    else:
+        # (not ``pre``: the seam's, assigned under a traced ``if`` below, must
+        # not become that branch's state)
+        core_pre = back.core_loads(c, core)
+        ops0 = back.o_loads(c, b)
+        ops1 = back.o_loads(c, b + BLOCKS)
+        back.load_core(c, core, core_pre)
+        back.stage_o(c, b, ops0)
+        back.stage_o(c, b + BLOCKS, ops1)
     # -- phase 2: the seam (and routing), the router rows, the pooler
     if b < NA:
         pre = seam.seam_loads(c, b)
@@ -664,7 +740,7 @@ def _split(key: K2Build, s: int, lds: dict, keyed: tuple, debug_dump: bool):
             "alarm": alarm,
         }
         c = make_context(s, args, lds, key=key)
-        program(c, debug_dump, "split")
+        program(c, debug_dump, "split", key.oproj_issue)
 
     @flyc.jit
     def launch(

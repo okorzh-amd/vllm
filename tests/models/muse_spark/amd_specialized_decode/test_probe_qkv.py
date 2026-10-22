@@ -84,6 +84,8 @@ NQK = spec.HEADS + spec.KV_HEADS  # q and k heads a token (normalized)
 SLOT = spec.k1_slot(1)  # the probes' K1 slot (layer 1)
 PAD_BYTES = 16  # the pad flags (whole words: ld_pad's)
 WIDTHS = (1, 3, 8)
+# TUNE L1's K1 variants (``K1Build.layout``) in the front probe
+FRONT_VARIANTS = ("r256",)
 FRONT_ARGS = (
     "w_qkv",
     "positions",
@@ -142,22 +144,47 @@ def _front(c):
         epilogue.stage_epilogue(c, b, boundary.epilogue_inputs(c, b))
 
 
-def _front_lds(s: int) -> dict:
-    return {qkv.STAGE: qkv.lds_struct(s)}
+@traced
+def _front_roles(c):
+    """K1 past the boundary under the r256 layout (TUNE L1): CTAs [0, NA)
+    run their 6 tasks, then (b < 5 S) their epilogue unit, as K1's boundary
+    CTAs do past their publish; the GEMV CTAs their 10."""
+    b = fx.Int32(c["bid"])
+    bound, gemv_role = qkv.roles("r256")
+    if b < spec.NA:
+        ops = qkv.qkv_loads(c, b, bound)
+        qkv.stage_qkv(c, b, ops, bound)
+        if b < spec.E_UNITS * c["S"]:
+            epilogue.stage_epilogue(c, b, boundary.epilogue_inputs(c, b))
+    if b >= spec.K1_GEMV0:
+        g = b - spec.K1_GEMV0
+        ops = qkv.qkv_loads(c, g, gemv_role)
+        qkv.stage_qkv(c, g, ops, gemv_role)
 
 
-def _front_probe(s: int, rope: bool, debug: bool = True) -> context.Probe:
+def _front_lds(s: int, layout: str = "g192") -> dict:
+    n = max(r.n for r in qkv.roles(layout))
+    return {qkv.STAGE: qkv.lds_struct(s, n)}
+
+
+def _front_probe(
+    s: int,
+    rope: bool,
+    debug: bool = True,
+    layout: str = "g192",
+) -> context.Probe:
     kind = "rope" if rope else "nope"
+    variant = "" if layout == "g192" else f"_{layout}"
     return context.probe_kernel(
-        f"muse_probe_k1_front_s{s}_{kind}" + ("_dbg" if debug else ""),
+        f"muse_probe_k1_front_s{s}_{kind}{variant}" + ("_dbg" if debug else ""),
         s,
-        _front,
-        _front_lds(s),
+        _front if layout == "g192" else _front_roles,
+        _front_lds(s, layout),
         FRONT_ARGS,
         blocks=spec.BLOCKS,
         peers=False,
         route_lds=False,
-        build=spec.K1Build(tokens=s, rope=rope, debug_dump=debug),
+        build=spec.K1Build(tokens=s, rope=rope, debug_dump=debug, layout=layout),
     )
 
 
@@ -293,10 +320,11 @@ def _sub_of_two_muls(code: list[str]) -> bool:
 
 def test_stage_regions():
     """The stages poll and put only K1's scratch mailboxes (rank-local)."""
+    k1_all = set(spec.K1_REGIONS) | set(spec.K1_REGIONS_BY_LAYOUT["r256"])
     for mod in (qkv, epilogue):
-        assert set(mod.STAGE_REGIONS) <= set(spec.K1_REGIONS), mod.STAGE
-    assert qkv.STAGE_REGIONS == ("ardy", "qpart")
-    assert epilogue.STAGE_REGIONS == ("qpart",)
+        assert set(mod.STAGE_REGIONS) <= k1_all, mod.STAGE
+    assert qkv.STAGE_REGIONS == ("ardy", "qpart", "qpart4")
+    assert epilogue.STAGE_REGIONS == ("qpart", "qpart4")
 
 
 def test_task_map_puts_every_partial_once():
@@ -329,6 +357,43 @@ def test_task_map_puts_every_partial_once():
         assert lo + hi == list(range(spec.KPARTS)), (tile, lo, hi)
         assert lo and hi
         assert qkv.contributors(tile)[0] == spec.k1_contributor0(tile)
+
+
+def test_r256_task_map_puts_every_partial_once():
+    """TUNE L1's r256 roles (``qkv.roles``): every tile's 2 to 4 contributors
+    put their partial once at ``contributors(tile, role)``-relative index c,
+    c = 0 the lowest K parts, together each K part once in ascending order;
+    the epilogue's count (``epilogue.n_contributors``) is the tile's; every
+    CTA's tasks span <= 2 tiles."""
+    puts: dict = {}
+    for role in qkv.roles("r256"):
+        for g in range(role.hi - role.lo):
+            tiles, run = [], []
+            for i in range(role.n):
+                tile, kp = qkv.task(g, i, role)
+                run.append(kp)
+                last = qkv.last_of_tile(g, i, role)
+                assert isinstance(last, bool)
+                if last:
+                    first, maxc = qkv.contributors(tile, role)
+                    assert maxc == 4
+                    c = g - first
+                    assert 0 <= c < epilogue.n_contributors("r256", tile)
+                    assert (tile, c) not in puts, (g, tile, c)
+                    assert spec.k1_contributors("r256", tile)[0] == role.lo + first
+                    puts[(tile, c)] = run
+                    tiles.append(tile)
+                    run = []
+            assert run == [] and 1 <= len(tiles) <= 2, (role, g, tiles)
+    for tile in range(spec.QKV_TILES):
+        n = epilogue.n_contributors("r256", tile)
+        assert n == spec.k1_contributors("r256", tile)[1] and 2 <= n <= 4
+        assert sum((puts[(tile, c)] for c in range(n)), []) == list(range(16))
+    assert len(puts) == sum(
+        epilogue.n_contributors("r256", t) for t in range(spec.QKV_TILES)
+    )
+    # E3's count is 2 everywhere
+    assert {epilogue.n_contributors("g192", t) for t in range(spec.QKV_TILES)} == {2}
 
 
 def test_epilogue_row_map():
@@ -509,6 +574,29 @@ def test_front_probe_compiles(s, rope, debug, tmp_path, monkeypatch):
         (epilogue.STAGE, "qpart", Space.SCRATCH, "poll"),
     }, acc
     assert rec.stages == [qkv.STAGE, epilogue.STAGE]
+
+
+@compiles
+@pytest.mark.parametrize("layout", FRONT_VARIANTS)
+@pytest.mark.parametrize("s", [1, 8])
+def test_front_variant_probe_compiles(s, layout, tmp_path, monkeypatch):
+    """The variant front probes compile within the 5.9 budgets: every role's
+    weights before its ardy poll; the r256 epilogue polls 4 qpart4 pairs a
+    lane."""
+    with plan.recording() as rec:
+        txt, res = _compile(_front_probe(s, True, layout=layout), tmp_path, monkeypatch)
+    roles = qkv.roles(layout)
+    assert len(_LOAD_NT.findall(txt)) == 4 * sum(r.rounds for r in roles)
+    assert len(_MFMA.findall(txt)) == 4 * sum(r.rounds for r in roles)
+    if not rec.accesses:
+        return
+    region = spec.K1_QPART[layout]
+    acc = {(a.stage, a.region, a.space, a.kind) for a in rec.accesses}
+    assert acc == {
+        (qkv.STAGE, "ardy", Space.SCRATCH, "poll"),
+        (qkv.STAGE, region, Space.SCRATCH, "put"),
+        (epilogue.STAGE, region, Space.SCRATCH, "poll"),
+    }, acc
 
 
 @compiles
@@ -742,8 +830,23 @@ def test_front_matches_stock(s, rope):
     rows and the whole cache ``torch.equal`` the stock insert run on
     ``qkvd`` (same positions, slots, cache contents); pad rows zero; a
     second launch (next epoch) bit-identical."""
+    _front_matches_stock(_front_probe(s, rope), s, rope)
+
+
+@needs_gfx950
+@pytest.mark.parametrize("layout", FRONT_VARIANTS)
+@pytest.mark.parametrize("rope", [False, True])
+@pytest.mark.parametrize("s", WIDTHS)
+def test_front_variant_matches_stock(s, rope, layout):
+    """``test_front_matches_stock`` on a variant build: the r256 layout (2 to
+    4 contributors a tile, ``qpart4``). The acceptance is the same (vs fp64,
+    vs F.linear on >= 99 %, the stock insert bit for bit, deterministic
+    across launches)."""
+    _front_matches_stock(_front_probe(s, rope, layout=layout), s, rope)
+
+
+def _front_matches_stock(probe, s, rope):
     dev = torch.device("cuda")
-    probe = _front_probe(s, rope)
     bufs = context.ProbeBuffers(slot=SLOT)
     table = reference.rope_table(MAX_POS, device=dev) if rope else None
     blocks = 4096

@@ -51,6 +51,11 @@ SCRATCH_BC = {
     "pstat": (1025024, 16384),
     "opart": (1041408, 524288),
 }
+# Tuning variants' mailboxes past every plain region (no offset above moves):
+# K1 r256's partials, up to 4 contributors a tile.
+SCRATCH_TAIL = {
+    "qpart4": (1565696, 589824),
+}
 PEER = {
     "ar": (0, 2097152),
     "rlog": (2097152, 16384),
@@ -63,8 +68,10 @@ PEER = {
 
 
 def test_layouts_match_the_design():
-    assert spec.scratch_layout() == {**SCRATCH, **SCRATCH_BC}
-    assert spec.scratch_bytes() == 1565696  # DESIGN_BC 5.7
+    assert spec.scratch_layout() == {**SCRATCH, **SCRATCH_BC, **SCRATCH_TAIL}
+    # DESIGN_BC 5.7's 1,565,696 B, then the tail
+    assert max(o + n for o, n in SCRATCH_BC.values()) == 1565696
+    assert spec.scratch_bytes() == 1565696 + 589824
     # Phase A's part: every offset of DESIGN 5.10, its end where B / C start
     assert max(o + n for o, n in SCRATCH.values()) == 534016
     pairs = sum(n for name, (_, n) in SCRATCH_BC.items() if name in spec.REGIONS)
@@ -86,6 +93,7 @@ def test_regions_are_aligned_ordered_and_disjoint(layout):
             spec.XROW,
             *spec.SCRATCH_REGIONS_BC,
             *(name for name, _, _ in spec.SCRATCH_PLAIN_BC),
+            *spec.SCRATCH_REGIONS_TAIL,
         )
     else:
         got = spec.peer_layout()
@@ -163,7 +171,12 @@ def test_pair_layout_matches_plans():
 
 def _cover(region: str, indexes) -> None:
     """``indexes`` hit every pair of ``region`` exactly once."""
-    pairs = dict(spec.SCRATCH_PAIRS + spec.SCRATCH_PAIRS_BC + spec.PEER_PAIRS)[region]
+    pairs = dict(
+        spec.SCRATCH_PAIRS
+        + spec.SCRATCH_PAIRS_BC
+        + spec.SCRATCH_PAIRS_TAIL
+        + spec.PEER_PAIRS
+    )[region]
     got = sorted(indexes)
     assert got == list(range(pairs)), region
 
@@ -241,6 +254,15 @@ def test_every_pair_index_formula_tiles_its_region():
             )
         ),
     )
+    _cover(
+        "qpart4",
+        (
+            spec.k1_qpart_pair("r256", T, c, t, r)
+            for T, c, t, r in P(range(spec.QKV_TILES), range(4), range(MT), range(16))
+        ),
+    )
+    for T, c, t, r in P(range(0, spec.QKV_TILES, 7), range(2), range(MT), (0, 15)):
+        assert spec.k1_qpart_pair("g192", T, c, t, r) == spec.qpart_pair(T, c, t, r)
     _cover("srdy", (spec.srdy_pair(u) for u in range(spec.BLOCKS)))
     _cover("crdy", (spec.crdy_pair(t, h) for t, h in P(range(MT), range(spec.HEADS))))
 
@@ -352,6 +374,47 @@ def test_k1_placement():
     # the K1 grid: weight-free boundary CTAs [0, NA), GEMV CTAs past them
     assert spec.K1_GEMV0 + spec.K1_GEMV_CTAS == spec.BLOCKS
     assert spec.E_UNITS * spec.MAX_ROWS <= spec.K1_GEMV0
+
+
+@pytest.mark.parametrize("layout", spec.K1_LAYOUTS)
+def test_k1_task_layouts(layout):
+    """Every layout runs the 2304 tasks once each, a CTA's tasks consecutive
+    and even (rounds of 2) with distinct K parts; no tile straddles two roles,
+    so contributors (``k1_contributors``) are consecutive CTAs of one role
+    holding consecutive K part runs, c = 0 the lowest; at most
+    ``K1_MAXC_BY_LAYOUT`` of them (E3: exactly 2; r256: 2 to 4, M2's map)."""
+    roles = spec.K1_ROLES[layout]
+    seen = []
+    for lo, hi, n, tau0 in roles:
+        assert n % 2 == 0 and n <= spec.KPARTS and tau0 % spec.KPARTS == 0
+        for b in range(lo, hi):
+            taus = [tau0 + n * (b - lo) + i for i in range(n)]
+            assert all(spec.k1_cta(layout, tau) == b for tau in taus)
+            seen += taus
+    assert sorted(seen) == list(range(spec.K1_TASKS))
+    counts = set()
+    for T in range(spec.QKV_TILES):
+        first, nc = spec.k1_contributors(layout, T)
+        counts.add(nc)
+        runs = []
+        for c in range(nc):
+            b = first + c
+            lo, hi, n, tau0 = spec.k1_role(layout, spec.KPARTS * T)
+            assert lo <= b < hi  # one role
+            taus = [tau0 + n * (b - lo) + i for i in range(n)]
+            runs += [tau % spec.KPARTS for tau in taus if tau // spec.KPARTS == T]
+        assert runs == list(range(spec.KPARTS)), (layout, T)
+    want = {"g192": {2}, "r256": {2, 3, 4}}[layout]
+    assert counts == want and max(counts) == spec.K1_MAXC_BY_LAYOUT[layout]
+    if layout == "g192":
+        assert roles == ((spec.K1_GEMV0, spec.BLOCKS, spec.K1_TPC, 0),)
+        for T in range(spec.QKV_TILES):
+            assert spec.k1_contributors(layout, T)[0] == (
+                spec.K1_GEMV0 + spec.k1_contributor0(T)
+            )
+    else:  # the boundary CTAs take 6 tasks, the GEMV CTAs 10
+        assert roles == ((0, spec.NA, 6, 0), (spec.NA, spec.BLOCKS, 10, 6 * spec.NA))
+    assert spec.K1_QPART[layout] in spec.K1_REGIONS_BY_LAYOUT[layout]
 
 
 @pytest.mark.parametrize("S", range(1, spec.MAX_ROWS + 1))
@@ -559,6 +622,9 @@ def test_k2_build_cores():
         "fault_ticks",
         "core",
         "window",
+        "oproj_issue",
+        "split_n",
+        "split_min_per",
     ]
     assert spec.K2_CORES == ("tensor", "gated", "split")
     names = {
@@ -589,6 +655,198 @@ def test_k2_build_cores():
     for bad in (dict(tokens=1, core=1), dict(tokens=1, core="split", window=1)):
         with pytest.raises(TypeError):
             K2Build(**bad)
+
+
+def test_k2_build_oproj_issue():
+    """TUNE L2: ``oproj_issue`` is a split-only key field, "late" by default
+    (the 7.2 build, its name unchanged); "early" names its own symbol."""
+    assert K2Build(tokens=2, core="split").oproj_issue == "late"
+    assert spec.OPROJ_ISSUES == ("late", "early")
+    assert K2Build(tokens=2, core="split", window=True, oproj_issue="late") == (
+        K2Build(tokens=2, core="split", window=True)
+    )
+    names = [
+        K2Build(tokens=2, core="split", oproj_issue="early").kernel_name(),
+        K2Build(tokens=2, core="split", window=True, oproj_issue="early").kernel_name(),
+        K2Build(
+            tokens=8,
+            core="split",
+            window=True,
+            oproj_issue="early",
+            fault_rank=1,
+            fault_epoch=2,
+            fault_slot=130,
+            fault_ticks=7,
+            debug_dump=True,
+        ).kernel_name(),
+    ]
+    assert names == [
+        "muse_mono_k2_s2_full_oe",
+        "muse_mono_k2_s2_sw_oe",
+        "muse_mono_k2_s8_sw_oe_f1_2_130_7_dbg",
+    ]
+    for bad in (
+        dict(tokens=1, core="split", oproj_issue="soon"),
+        dict(tokens=1, oproj_issue="early"),  # tensor
+        dict(tokens=1, core="gated", oproj_issue="early"),
+    ):
+        with pytest.raises(ValueError):
+            K2Build(**bad)
+    with pytest.raises(TypeError):
+        K2Build(tokens=1, core="split", oproj_issue=1)
+
+
+def test_oproj_tasks_cover_every_task_once():
+    """TUNE L2's placement: under "early" every o_proj task runs on exactly
+    one CTA, the 16 S combine CTAs run none, a CTA below C0 its own two
+    first, then at most ``oproj_slots`` moved ones (the CTAs next to C0
+    first); "late" is 7.2's (b, b + 256)."""
+    for s in range(1, spec.MAX_ROWS + 1):
+        c0 = spec.C0(s)
+        late = [spec.oproj_tasks(s, b, "late") for b in range(spec.BLOCKS)]
+        assert late == [[b, b + spec.BLOCKS] for b in range(spec.BLOCKS)]
+        early = [spec.oproj_tasks(s, b, "early") for b in range(spec.BLOCKS)]
+        flat = [t for ts in early for t in ts]
+        assert sorted(flat) == list(range(spec.O_TASKS)), s
+        assert all(early[b] == [] for b in range(c0, spec.BLOCKS))
+        assert all(early[b][:2] == [b, b + spec.BLOCKS] for b in range(c0))
+        extra = [len(early[b]) - 2 for b in range(c0)]
+        assert max(extra) == spec.oproj_slots(s) and min(extra) >= 0
+        assert sum(extra) == spec.oproj_moved(s) == 2 * spec.HEADS * s
+        # the moved tasks are exactly the combine CTAs' own
+        moved = {t for b in range(c0) for t in early[b][2:]}
+        assert moved == {
+            t for b in range(c0, spec.BLOCKS) for t in (b, b + spec.BLOCKS)
+        }
+        # the CTAs next to C0 take them first (a sliding build's no-role
+        # CTAs [n_units, C0) at S = 1 .. 3 hold every moved task)
+        holders = [b for b in range(c0) if extra[b]]
+        assert holders == list(range(c0 - len(holders), c0)) or len(holders) == c0
+    assert [spec.oproj_slots(s) for s in range(1, 9)] == [1, 1, 1, 1, 1, 2, 2, 2]
+    for s in (1, 2, 3):
+        n = spec.n_units(s, True)
+        # the split units keep their two
+        assert all(len(spec.oproj_tasks(s, b, "early")) == 2 for b in range(n)), s
+    with pytest.raises(ValueError):
+        spec.oproj_tasks(1, 0, "soon")
+
+
+def test_k2_build_split_retune_fields():
+    """TUNE L3: ``split_n`` / ``split_min_per`` are split-only key fields
+    whose defaults are the design's (0 = ``nsplit``, MIN_PER: the 7.1 build,
+    its name unchanged); a design value given explicitly is refused (one
+    build, one key), a value past 7.1's invariants too; a tuned build names
+    its own symbol."""
+    base = K2Build(tokens=2, core="split")
+    assert (base.split_n, base.split_min_per) == (0, 8)
+    assert (base.nsplit(), base.n_units(), base.c0()) == (64, 256, 224)
+    assert base.oproj_slots() == 0
+    assert K2Build(tokens=2, core="split", oproj_issue="early").oproj_slots() == 1
+    assert base.split_suffix() == "" and base.kernel_name() == "muse_mono_k2_s2_full"
+    k = K2Build(tokens=2, core="split", window=True, split_n=17)
+    assert (k.nsplit(), k.n_units(), k.c0()) == (17, 68, 224)
+    names = [
+        k.kernel_name(),
+        K2Build(tokens=1, core="split", split_n=16, split_min_per=16).kernel_name(),
+        K2Build(
+            tokens=8,
+            core="split",
+            split_min_per=16,
+            oproj_issue="early",
+            debug_dump=True,
+        ).kernel_name(),
+    ]
+    assert names == [
+        "muse_mono_k2_s2_sw_n17",
+        "muse_mono_k2_s1_full_n16_m16",
+        "muse_mono_k2_s8_full_m16_oe_dbg",
+    ]
+    for bad in (
+        dict(tokens=1, split_n=16),  # tensor
+        dict(tokens=1, core="gated", split_min_per=16),
+        dict(tokens=1, core="split", split_n=128),  # the design's N
+        dict(tokens=1, core="split", window=True, split_n=16),
+        dict(tokens=2, core="split", split_n=65),  # 2 S N > 256
+        dict(tokens=1, core="split", split_n=-1),
+        dict(tokens=1, core="split", split_min_per=0),
+    ):
+        with pytest.raises(ValueError):
+            K2Build(**bad)
+    for bad in (
+        dict(tokens=1, core="split", split_n=True),
+        dict(tokens=1, core="split", split_min_per=16.0),
+    ):
+        with pytest.raises(TypeError):
+            K2Build(**bad)
+
+
+def _preset_keys():
+    for p, S, w in P(spec.SPLIT_PRESETS, range(1, spec.MAX_ROWS + 1), (False, True)):
+        yield p, K2Build(tokens=S, core="split", window=w, **spec.split_fields(p, S, w))
+
+
+def test_split_presets():
+    """TUNE L3's presets: every one gives a valid key at every width and kind
+    (2 S N <= 256, combines in the upper half), "base" the design's build; the
+    atoms touch the fields they name only; "+" composes; "narrow" is
+    short+wide to width 4 and coarse above; unknown names (and the removed
+    comb2 / comb4 / full32) are refused; the default is "coarse"."""
+    assert spec.DEFAULT_SPLIT_PRESET == "coarse"
+    assert spec.SPLIT_PRESETS == ("base", "short", "wide", "coarse", "narrow")
+    for p, k in _preset_keys():
+        S, w = k.tokens, k.window
+        assert k.n_units() <= spec.BLOCKS and k.c0() >= spec.BLOCKS // 2, (p, k)
+        assert spec.n_units(S, w, k.split_n) == k.n_units()
+        if p == "base":
+            assert k == K2Build(tokens=S, core="split", window=w)
+        f = spec.split_fields(p, S, w)
+        if p == "short" and w or p == "wide" and not w:
+            assert f == {}, (p, S, w)
+    sw = [spec.split_fields("wide", s, True).get("split_n") for s in range(1, 9)]
+    assert sw == [17] * 7 + [None]  # S = 8: 16 is the cap and the design's
+    full = [spec.split_fields("short", s, False).get("split_n") for s in range(1, 9)]
+    assert full == [16, 16, 16, 16, 16, 16, 16, None]
+    assert spec.split_fields("coarse", 1, True) == {"split_n": 9, "split_min_per": 16}
+    assert spec.split_fields("coarse", 1, False) == {"split_min_per": 16}
+    for S, w in P(range(1, 9), (False, True)):
+        both = spec.split_fields("short+wide", S, w)
+        want = spec.split_fields("coarse", S, w) if S > spec.NARROW_MAX else both
+        assert spec.split_fields("narrow", S, w) == want
+        assert spec.split_fields("coarse+short", S, w) == {
+            **spec.split_fields("coarse", S, w),
+            **spec.split_fields("short", S, w),
+        }
+    for bad in ("", "nope", "short+", "short+nope", "comb2", "full32", None, 1):
+        with pytest.raises(ValueError):
+            spec.check_split_preset(bad)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("window", [False, True])
+def test_split_presets_plan_every_key_once(window):
+    """Every preset's (N, MIN_PER) splits each context into live <= N units
+    of >= MIN_PER pages (one short), together every page once; "wide" holds a
+    whole sliding window at one page a wave, "coarse" at two."""
+    seen = set()
+    for p, k in _preset_keys():
+        if k.window != window or (k.tokens, k.nsplit(), k.split_min_per) in seen:
+            continue
+        seen.add((k.tokens, k.nsplit(), k.split_min_per))
+        n, mp = k.nsplit(), k.split_min_per
+        for L in SPLIT_LENS:
+            lo, b0, nb, per, live = spec.split_plan(L, window, n, mp)
+            assert per >= mp and live <= n, (p, L)
+            pages: list[int] = []
+            for q in range(n):
+                first, end = b0 + q * per, min(b0 + (q + 1) * per, b0 + nb)
+                if q < live:
+                    assert first < end
+                    pages += range(first, end)
+                else:
+                    assert first >= end
+            assert pages == list(range(b0, b0 + nb)), (p, L)
+    if window:
+        assert spec.split_plan(4103, True, 17)[3:] == (8, 17)
+        assert spec.split_plan(4103, True, 9, 16)[3:] == (16, 9)
 
 
 def test_build_counts_and_names_are_distinct():
@@ -635,6 +893,13 @@ def test_k1_build_key():
     assert K1Build(tokens=2, rope=True, debug_dump=True).kernel_name() == (
         "muse_mono_k1_s2_rope_dbg"
     )
+    # the opt-in variants: defaults keep the E3 build's name
+    assert k.layout == "g192"
+    assert K1Build(1, True, layout="r256").kernel_name() == "muse_mono_k1_s1_rope_r256"
+    with pytest.raises(ValueError):
+        K1Build(tokens=1, rope=True, layout="r192")
+    with pytest.raises(TypeError):
+        K1Build(tokens=1, rope=True, layout=None)
     for bad in (
         dict(tokens=0, rope=True),
         dict(tokens=9, rope=True),
@@ -688,6 +953,12 @@ def test_k2_build_key_tuple():
         *(K2Build(tokens=s) for s in range(1, spec.MAX_ROWS + 1)),
         K2Build(tokens=8, debug_dump=True),
         K2Build(tokens=8, fault_rank=3, fault_epoch=5, fault_slot=129, fault_ticks=9),
+    ]
+    builds += [
+        K2Build(tokens=2, core="split"),
+        K2Build(tokens=2, core="split", split_n=16),
+        K2Build(tokens=2, core="split", split_min_per=16),
+        K2Build(tokens=2, core="split", split_n=16, oproj_issue="early"),
     ]
     keys = [plan.key_tuple(b, "src") for b in builds]
     assert len(set(keys)) == len(builds)
@@ -760,8 +1031,11 @@ def test_k1_args():
 
 def test_regions():
     assert spec.REGIONS == spec.SCRATCH_REGIONS_ALL + spec.PEER_REGIONS
-    assert spec.SCRATCH_REGIONS_ALL == spec.SCRATCH_REGIONS + spec.SCRATCH_REGIONS_BC
-    assert len(set(spec.REGIONS)) == len(spec.REGIONS) == 22
+    assert spec.SCRATCH_REGIONS_ALL == (
+        spec.SCRATCH_REGIONS + spec.SCRATCH_REGIONS_BC + spec.SCRATCH_REGIONS_TAIL
+    )
+    assert spec.SCRATCH_REGIONS_TAIL == ("qpart4",)
+    assert len(set(spec.REGIONS)) == len(spec.REGIONS) == 23
     assert tuple(n for n, _ in spec.SCRATCH_PAIRS) == spec.SCRATCH_REGIONS
     assert tuple(n for n, _ in spec.SCRATCH_PAIRS_BC) == spec.SCRATCH_REGIONS_BC
     assert tuple(n for n, _ in spec.PEER_PAIRS) == spec.PEER_REGIONS
@@ -771,6 +1045,8 @@ def test_regions():
     # split core the B / C mailboxes, each one exactly one kernel's
     assert spec.K2_REGIONS == spec.SCRATCH_REGIONS + spec.PEER_REGIONS
     assert spec.K1_REGIONS + spec.SPLIT_REGIONS == spec.SCRATCH_REGIONS_BC
+    assert spec.K1_REGIONS_BY_LAYOUT["g192"] == spec.K1_REGIONS
+    assert spec.K1_REGIONS_BY_LAYOUT["r256"] == ("fss", "nss", "ardy", "qpart4")
     # A wait record names its region by CRC-32 (common/debug.region_id): no clash.
     ids = {zlib.crc32(n.encode()) & 0x7FFFFFFF for n in spec.REGIONS}
     assert len(ids) == len(spec.REGIONS)

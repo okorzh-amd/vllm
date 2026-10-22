@@ -709,6 +709,152 @@ def test_k1_trace_is_the_program_order(rope, tmp_path, monkeypatch):
     assert puts == regions and polls == regions, (puts, polls)
 
 
+# ---------------------------------------------------------------- K1 tuning variants
+
+# TUNE L1 (the opt-in ``K1Build.layout``; the defaults above are unchanged):
+# the r256 task layout (DESIGN_BC 11.3 rung 3, M2's 10/6 rebalance) at every
+# width and kind; r256's debug and fault builds (the tests' numerics and
+# stall runs)
+K1_VARIANT_LAYOUTS = ("r256",)
+K1_VARIANTS = [
+    spec.K1Build(tokens=s, rope=rope, layout=lay)
+    for lay in K1_VARIANT_LAYOUTS
+    for s in range(1, spec.MAX_ROWS + 1)
+    for rope in (False, True)
+] + [
+    spec.K1Build(tokens=8, rope=True, debug_dump=True, layout="r256"),
+    spec.K1Build(tokens=8, rope=False, debug_dump=True, layout="r256"),
+    spec.K1Build(tokens=1, rope=True, debug_dump=True, layout="r256"),
+    spec.K1Build(
+        tokens=8,
+        rope=False,
+        fault_ticks=WAIT_TICKS * 3 // 2,
+        layout="r256",
+        **K1_FAULT,
+    ),
+]
+
+
+def test_k1_variant_keys_and_lds():
+    """Every variant has its own symbol (the defaults keep theirs), every
+    width holds more than half a CU's LDS (one CTA a CU), and r256's GEMV
+    CTAs stage 10 K parts."""
+    from vllm.models.muse_spark.amd.specialized_decode.mono import k1
+    from vllm.models.muse_spark.amd.specialized_decode.mono.front import qkv
+
+    names = [k.kernel_name() for k in K1_BUILDS + K1_VARIANTS]
+    assert len(set(names)) == len(names)
+    assert k1.max_tasks("g192") == spec.K1_TPC and k1.max_tasks("r256") == 10
+    for s in range(1, spec.MAX_ROWS + 1):
+        assert k1.lds_bytes(s) == k1.key_lds_bytes(spec.K1Build(s, True))
+        for lay in K1_VARIANT_LAYOUTS:
+            got = k1.lds_bytes(s, lay)
+            assert spec.LDS_BYTES // 2 < got <= spec.LDS_BYTES, (s, lay, got)
+            rows = 8192 + k1.max_tasks(lay) * s * qkv.XA_ROW * 2
+            assert got == max(rows, k1.RESIDENT_LDS), (s, lay, got)
+
+
+@compiles
+@pytest.mark.parametrize("key", K1_VARIANTS, ids=lambda k: k.kernel_name())
+def test_k1_variants_compile_without_a_gpu(key, tmp_path, monkeypatch):
+    """The 5.9 gate on every variant build, and rule 8 in each role's code:
+    r256's boundary CTAs issue their weights only past the slice's publish
+    (no weight in flight at the fss / nss polls or the publish), their ardy
+    poll holds only those weights, the epilogue's qpart4 poll follows their
+    last MFMA (nothing but cos / sin in flight) and loads nothing plain past
+    it; the GEMV CTAs' weights all precede their ardy poll."""
+    from vllm.models.muse_spark.amd.specialized_decode.mono import k1
+    from vllm.models.muse_spark.amd.specialized_decode.mono.front import qkv
+
+    txt, res = _compile_k1(key, tmp_path, monkeypatch)
+    print(f"{key.kernel_name()}: {res}")
+    assert res["private_segment_fixed_size"] == 0, res
+    assert res["next_free_vgpr"] <= spec.VGPR_MAX, res
+    assert res["group_segment_fixed_size"] == k1.key_lds_bytes(key), res
+    assert res["group_segment_fixed_size"] <= spec.LDS_BYTES, res
+    assert res["group_segment_fixed_size"] > spec.LDS_BYTES // 2, res  # one a CU
+    loops = _WATERFALL.findall(txt)
+    assert not loops, f"{len(loops)} waterfall compares, e.g. {loops[0]}"
+    polls = [m.start() for m in _POLL_SLEEP.finditer(txt)]
+    nt = [m.start() for m in tq._LOAD_NT.finditer(txt)]
+    mfma = [m.start() for m in tq._MFMA.finditer(txt)]
+    roles = qkv.roles(key.layout)
+    assert len(nt) == 4 * sum(r.rounds for r in roles), len(nt)
+    assert len(mfma) == 4 * sum(r.rounds for r in roles), len(mfma)
+    if key.layout == "g192":
+        assert len(polls) == 4, polls  # fss, nss, qpart, ardy
+        fss, nss, qpart, ardy = polls
+        segments = [(nt, ardy, len(txt))]
+        epi_end = nt[0]
+    else:
+        assert len(polls) == 5, polls  # fss, nss, ardy (boundary), qpart, ardy
+        fss, nss, ardy_b, qpart, ardy = polls
+        nb = 4 * roles[0].rounds
+        bound_nt, gemv_nt = nt[:nb], nt[nb:]
+        # the boundary CTAs' weights: past the slice's publish (its vmcnt(0)
+        # and barrier follow the nss poll), before their own ardy poll
+        publish = [m.start() for m in _BARRIER.finditer(txt, nss, bound_nt[0])]
+        assert publish, "no publish barrier between the nss poll and the weights"
+        assert nss < bound_nt[0] and bound_nt[-1] < ardy_b
+        # their MFMAs before the epilogue's poll; the GEMV CTAs' after
+        assert all(ardy_b < m < qpart for m in mfma[:nb]), "boundary GEMV order"
+        assert qpart < gemv_nt[0] and gemv_nt[-1] < ardy
+        assert all(m > ardy for m in mfma[nb:])
+        # (the boundary CTAs' segment ends at their last MFMA: the
+        # epilogue's cos / sin loads follow it, before the qpart poll)
+        segments = [(bound_nt, ardy_b, mfma[nb - 1]), (gemv_nt, ardy, len(txt))]
+        plain_mid = tq._PLAIN_LOAD.findall(txt, mfma[nb - 1], qpart)
+        assert len(plain_mid) == (2 if key.rope else 0), plain_mid
+        epi_end = gemv_nt[0]
+    # the boundary: no weight before its polls; two norms, nothing fused
+    assert nt[0] > nss
+    front = tq._code(txt[:qpart])
+    assert sum(1 for x in front if x.startswith("v_rsq_f32")) == 2
+    # the epilogue: no plain load past its poll; one rsq; RoPE's 3 fmas
+    epi_txt = txt[qpart:epi_end]
+    assert not tq._PLAIN_LOAD.findall(epi_txt)
+    epi = tq._code(epi_txt)
+    assert sum(1 for x in epi if x.startswith("v_rsq_f32")) == 1
+    assert len(tq._fmas(epi)) == (4 if key.rope else 1), tq._fmas(epi)
+    shorts = len(_STORE_SHORT.findall(epi_txt))
+    assert shorts == (3 if key.debug_dump else 2), shorts
+    assert len(_STORE_SHORT.findall(txt)) == shorts
+    # each GEMV role: its weights before its poll, its B operand past it
+    for (w, poll, end), role in zip(segments, roles):
+        assert w[-1] < poll
+        first = tq._MFMA.search(txt, poll, end).start()
+        dev = [m.start() for m in tq._LOAD_DEV.finditer(txt, poll, first)]
+        writes = [m.start() for m in _DS_WRITE4.finditer(txt, poll, first)]
+        want = -(-role.n * key.tokens * qkv.X4 // spec.THREADS)
+        assert len(dev) == want, (len(dev), want, role)
+        assert writes and dev[-1] < writes[0]
+        assert not tq._PLAIN_LOAD.findall(txt, poll, end)
+
+
+@compiles
+def test_k1_r256_trace_is_the_program_order(tmp_path, monkeypatch):
+    """r256's trace: the boundary, the boundary CTAs' GEMV, the epilogue, the
+    GEMV CTAs' GEMV; every access named and declared by its stage module;
+    the layout's K1 regions (qpart4, not qpart) put and polled, scratch
+    only."""
+    from vllm.models.muse_spark.amd.specialized_decode.mono import k1
+
+    key = spec.K1Build(tokens=3, rope=True, layout="r256")
+    with plan.recording() as rec:
+        _compile_k1(key, tmp_path, monkeypatch)
+    want = ("boundary", "qkv", "epilogue", "qkv")
+    assert tuple(rec.stages) == want, rec.stages
+    assert not rec.unnamed, rec.unnamed
+    puts: set = set()
+    polls: set = set()
+    for a in rec.accesses:
+        assert a.region in k1.STAGE_MODULES[a.stage].STAGE_REGIONS, a
+        assert a.space == plan.Space.SCRATCH, a
+        (puts if a.kind == "put" else polls).add(a.region)
+    regions = set(spec.K1_REGIONS_BY_LAYOUT["r256"])
+    assert puts == regions and polls == regions, (puts, polls)
+
+
 if __name__ == "__main__":
     # python3 test_compile.py --write-baseline <source> <image>: see BASELINE's
     # "procedure" (only ever from the Phase A sources)

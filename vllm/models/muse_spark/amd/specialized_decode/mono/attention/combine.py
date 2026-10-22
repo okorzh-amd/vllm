@@ -4,8 +4,8 @@
 one (token t, q head h) merged into the attention output, its output norm and
 gate, the gated row -> ``xo`` and the ``crdy`` flag.
 
-Combine k = 16 t + h runs on CTA ``C0(S) + k`` (``spec.C0``); kvh, j =
-divmod(h, 8): it reads q head j of the N = ``spec.nsplit(S, window)`` units u
+Combine k = 16 t + h runs on CTA ``C0(S) + k`` (``K2Build.c0``); kvh, j =
+divmod(h, 8): it reads q head j of the N = ``K2Build.nsplit()`` units u
 = (2 t + kvh) N + p of its (t, kvh), each published by its split unit
 (``srdy[u]``, ``attention/split.py``) as plain fp32 regions, device scope:
 
@@ -98,7 +98,6 @@ from vllm.models.muse_spark.amd.specialized_decode.mono.spec import (
     XO,
     K2Build,
     crdy_pair,
-    nsplit,
     opart_word,
     pstat_word,
     scratch_layout,
@@ -133,7 +132,7 @@ def _imax(a, b):
     return sel(a > b, a, b)
 
 
-def unit_plan(L, window: bool, n: int):
+def unit_plan(L, window: bool, n: int, min_per: int = MIN_PER):
     """A (token, KV head)'s split at context length L (0 on a pad row,
     clamped to the table): (lo, b0, nb, per, live), as ``spec.split_plan``
     and the split unit compute it. Python ints or traced Int32 (``sel``): the
@@ -141,15 +140,15 @@ def unit_plan(L, window: bool, n: int):
     lo = _imax(L - WINDOW, 0) if window else 0
     b0 = lo // KV_BLOCK
     nb = sel(L > 0, (L - 1) // KV_BLOCK - b0 + 1, 0)
-    per = _imax(cdiv(nb, n), MIN_PER)
+    per = _imax(cdiv(nb, n), min_per)
     return lo, b0, nb, per, cdiv(nb, per)
 
 
-def _window(c) -> bool:
+def _key(c) -> K2Build:
     key = c["key"]
     if not isinstance(key, K2Build) or key.core != "split":
         raise ValueError(f"the combine runs in a K2(split) build, not {key!r}")
-    return key.window
+    return key
 
 
 def _ld_bf16(addr, i):
@@ -176,16 +175,16 @@ def combine_loads(c, k) -> dict:
 
 @traced
 def stage_combine(c, k, pre=None, attn_out=None):
-    """Combine k = 16 t + h (CTA ``C0(S) + k``): the (t, kvh) units' partials
-    of q head j merged, gated -> ``xo`` row (t, h), then ``crdy[k]``
+    """Combine k = 16 t + h (CTA ``key.c0() + k``): the (t, kvh) units'
+    partials of q head j merged, gated -> ``xo`` row (t, h), then ``crdy[k]``
     published. ``pre``: ``combine_loads(c, k)`` (issued here if None).
     ``attn_out`` (tests): also store the bf16 attention output (before the
     gate) at element ``t * 1024 + 64 h + d`` of that address."""
     enter_stage(STAGE)
-    s, tid, lane = c["S"], c["tid"], c["lane"]
+    tid, lane = c["tid"], c["lane"]
     a, scr = c["args"], c["scr"]
-    window = _window(c)
-    n = nsplit(s, window)
+    key = _key(c)
+    window, n = key.window, key.nsplit()
     if const_expr(pre is None):
         pre = combine_loads(c, k)
     t, h = k // HEADS, k % HEADS
@@ -195,7 +194,7 @@ def stage_combine(c, k, pre=None, attn_out=None):
     dead = ((pre["pad"] >> (8 * (t % 4))) & 0xFF) != 0
     cap = a["bt_stride"] * KV_BLOCK
     L = dead.select(fx.Int32(0), fx.min(fx.max(pre["seq"], fx.Int32(0)), cap))
-    live = unit_plan(L, window, n)[4]
+    live = unit_plan(L, window, n, key.split_min_per)[4]
     # the live units' flags (the base re-read: this CTA's split unit put srdy
     # from one lane, uniform_addr's GVN-PRE case)
     if tid < live:

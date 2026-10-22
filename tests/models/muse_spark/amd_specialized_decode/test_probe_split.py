@@ -400,6 +400,26 @@ def test_split_pages_are_the_plan():
                     assert got == want, (S, w, L, p, got, want)
                     assert (got[1] < got[2]) == (p < live), (S, w, L, p)
     assert split.XL_ROW == back.XL_ROW and split.OKW == back.OKW
+    # TUNE L3: every preset's (N, MIN_PER)
+    seen = set()
+    for pr in spec.SPLIT_PRESETS:
+        for S in range(1, spec.MAX_ROWS + 1):
+            for w in (False, True):
+                k = spec.K2Build(
+                    tokens=S, core="split", window=w, **spec.split_fields(pr, S, w)
+                )
+                n, mp = k.nsplit(), k.split_min_per
+                if (w, n, mp) in seen or (n, mp) == (spec.nsplit(S, w), spec.MIN_PER):
+                    continue
+                seen.add((w, n, mp))
+                for L in sorted(Ls):
+                    lo, b0, nb, per, live = spec.split_plan(L, w, n, mp)
+                    for p in range(n):
+                        got = split.pages(L, w, n, p, mp)
+                        want = (lo, b0 + p * per, min(b0 + (p + 1) * per, b0 + nb))
+                        assert got == want, (pr, S, w, L, p, got, want)
+                        assert (got[1] < got[2]) == (p < live), (pr, S, w, L, p)
+    assert seen
 
 
 def test_cases_make_the_edges_bite():
@@ -489,21 +509,18 @@ def _load_core_probe(S: int):
     )
 
 
-def _core_body(n: int, c0: int):
-    """7.2's core without the weights: the split units, the combine CTAs
-    (each also dumping its bf16 attention output, before the gate, to
-    ``attn``), then every CTA's load_core; CTA b's xl rows -> ``out`` rows b
-    S .."""
-    combine = _combine()
+def _core_body():
+    """7.2's core without the weights: K2's own ``layer.split_roles`` (the
+    split units, the combine CTAs, each combine also dumping its bf16
+    attention output, before the gate, to ``attn``), then every CTA's
+    load_core; CTA b's xl rows -> ``out`` rows b S .."""
+    from vllm.models.muse_spark.amd.specialized_decode.mono import layer
 
     @traced
     def body(c):
         s, tid = c["S"], c["tid"]
         b = c["bid"]
-        if b < n:
-            split.stage_split(c, b)
-        if b >= c0:
-            combine.stage_combine(c, fx.Int32(b) - c0, attn_out=c["args"]["attn"])
+        layer.split_roles(c, attn_out=c["args"]["attn"])
         split.load_core(c)
         xl = c["lds"]["back"]["xl"]
         out = rsrc(c["args"]["out"] + fx.Int64(fx.Int32(b)) * (s * CORE * 2))
@@ -514,13 +531,20 @@ def _core_body(n: int, c0: int):
     return body
 
 
-def _core_probe(S: int, window: bool):
+def _core_key(S: int, window: bool, preset: str = "base") -> spec.K2Build:
+    """The split build key of the core probe: ``preset``'s (TUNE L3) fields."""
+    return spec.K2Build(
+        tokens=S, core="split", window=window, **spec.split_fields(preset, S, window)
+    )
+
+
+def _core_probe(S: int, window: bool, preset: str = "base"):
     combine = _combine()
-    n, c0 = spec.n_units(S, window), spec.C0(S)
+    key = _core_key(S, window, preset)
     return context.probe_kernel(
-        f"muse_probe_split_core_s{S}_{'sw' if window else 'full'}",
+        f"muse_probe_split_core_s{S}_{'sw' if window else 'full'}" + key.split_suffix(),
         S,
-        _core_body(n, c0),
+        _core_body(),
         {
             "back": back.lds_struct(S),
             "split": split.lds_struct(S),
@@ -528,8 +552,12 @@ def _core_probe(S: int, window: bool):
         },
         (*ARGS, "out", "attn"),
         blocks=spec.BLOCKS,
-        build=spec.K2Build(tokens=S, core="split", window=window),
-        key=(("units", n), ("c0", c0)),
+        build=key,
+        key=(
+            ("units", key.n_units()),
+            ("c0", key.c0()),
+            ("min_per", key.split_min_per),
+        ),
     )
 
 
@@ -631,6 +659,25 @@ def test_core_probe_compiles(S, window, tmp_path, monkeypatch):
     launches (split, combine, load_core on the full grid)."""
     txt, res = _compile(_core_probe(S, window), tmp_path, monkeypatch)
     print(f"core S={S} window={window}: {res}")
+    _gate(txt, res)
+
+
+# TUNE L3: the presets the core probe runs (``test_split_combine_core_preset``)
+PROBE_PRESETS = ("short", "wide", "coarse")
+
+
+@compiles
+@needs_combine
+@pytest.mark.parametrize("window", [False, True], ids=["full", "sw"])
+@pytest.mark.parametrize("S", [1, 3, 8])
+@pytest.mark.parametrize("preset", PROBE_PRESETS)
+def test_core_probe_compiles_preset(preset, S, window, tmp_path, monkeypatch):
+    """The gate on the TUNE L3 core probes (a preset that leaves the build
+    the design's at this width and kind is skipped)."""
+    if not spec.split_fields(preset, S, window):
+        pytest.skip(f"{preset} is the design's build at S={S} window={window}")
+    txt, res = _compile(_core_probe(S, window, preset), tmp_path, monkeypatch)
+    print(f"core {preset} S={S} window={window}: {res}")
     _gate(txt, res)
 
 
@@ -932,6 +979,27 @@ def test_split_combine_core(case):
     (``check_core``), and every CTA's xl rows equal the runtime-compiled
     ``rms_norm_gated`` of that very output bit for bit; pad rows exact
     zeros; no wait given up; 200 launches (a new epoch each) bit-identical."""
+    _split_combine_core(case, "base")
+
+
+@needs_gfx950
+@needs_combine
+@pytest.mark.parametrize(
+    "case",
+    [c for c in _cases(gpu=True) if c.layout == "LBHNC" and not c.big],
+    ids=lambda c: c.name,
+)
+@pytest.mark.parametrize("preset", PROBE_PRESETS)
+def test_split_combine_core_preset(preset, case):
+    """TUNE L3: ``test_split_combine_core``'s checks on a preset's build (its
+    N and MIN_PER through K2's ``split_roles``): the same core
+    targets, gate bit for bit, determinism over 200 launches."""
+    if not spec.split_fields(preset, case.S, case.window):
+        pytest.skip(f"{preset} is the design's build here")
+    _split_combine_core(case, preset)
+
+
+def _split_combine_core(case, preset: str) -> None:
     from vllm.third_party.flash_linear_attention.ops.kda import (
         rms_norm_gated,
     )
@@ -945,7 +1013,7 @@ def test_split_combine_core(case):
         _q(ns), ns.kv, ns.bt, ns.seq_lens, window=case.window, pad=ns.pad[:S]
     )
     poison(ns)
-    probe = _core_probe(S, case.window)
+    probe = _core_probe(S, case.window, preset)
     bufs = context.ProbeBuffers()
     out = torch.full((spec.BLOCKS * S, CORE), math.nan, dtype=bf, device="cuda")
     attn = torch.full((S, CORE), math.nan, dtype=bf, device="cuda")

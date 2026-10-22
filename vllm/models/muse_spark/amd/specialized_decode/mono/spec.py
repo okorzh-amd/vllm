@@ -176,6 +176,48 @@ def epilogue_row(unit: int, wave: int, lane: int) -> int | None:
     return ROW_G + 64 * (8 * (g5 - 3) + wave) + d  # og heads 8 (g5 - 3) + wave
 
 
+# K1's GEMV task layouts (``K1Build.layout``): each a tuple of roles (first
+# CTA, end CTA, tasks a CTA, first task); CTA b of a role runs tasks tau0 +
+# n (b - lo) + i, i < n, consecutive (M2's ``test_probe_m2.W_LAYOUTS``).
+#   g192  E3 (5.3): 12 tasks on each GEMV CTA [NA, BLOCKS), none on the
+#         boundary CTAs; K1_MAXC = 2 contributors a tile (``qpart``)
+#   r256  the 10/6 rebalance (11.3 rung 3, open question 1): 6 tasks on each
+#         boundary CTA [0, NA), issued after the slice's ``ardy`` publish
+#         (rule 8), 10 on each GEMV CTA; 2 to 4 contributors a tile
+#         (``qpart4``). No tile straddles the two roles (16 x 24 = 6 x 64).
+# Measured (STATUS_BC 11): r256's front is 1.3 us faster at width 1 and ~0.5
+# us slower at width 8 (c1 TPOT -1.5 %, c8 +0.5 %), so g192 stays the default.
+K1_LAYOUTS = ("g192", "r256")
+K1_ROLES = {
+    "g192": ((K1_GEMV0, BLOCKS, K1_TPC, 0),),
+    "r256": ((0, NA, 6, 0), (NA, BLOCKS, 10, 6 * NA)),
+}
+K1_MAXC_BY_LAYOUT = {"g192": K1_MAXC, "r256": 4}
+K1_QPART = {"g192": "qpart", "r256": "qpart4"}  # the layout's partials region
+
+
+def k1_role(layout: str, tau: int) -> tuple[int, int, int, int]:
+    """The role of ``layout`` whose CTAs run task ``tau``."""
+    for lo, hi, n, tau0 in K1_ROLES[layout]:
+        if tau0 <= tau < tau0 + n * (hi - lo):
+            return lo, hi, n, tau0
+    raise ValueError(f"task {tau} is past layout {layout!r}")
+
+
+def k1_cta(layout: str, tau: int) -> int:
+    """The CTA of ``layout`` that runs task ``tau``."""
+    lo, _, n, tau0 = k1_role(layout, tau)
+    return lo + (tau - tau0) // n
+
+
+def k1_contributors(layout: str, tile: int) -> tuple[int, int]:
+    """(the first CTA holding one of ``tile``'s K parts, how many CTAs do):
+    contributor c = b - first holds a run of the tile's K parts, c = 0 the
+    lower ones."""
+    first = k1_cta(layout, KPARTS * tile)
+    return first, k1_cta(layout, KPARTS * tile + KPARTS - 1) - first + 1
+
+
 assert K1_TASKS == K1_TPC * K1_GEMV_CTAS and ROWS * QKV_TILES == QKV_ROWS
 assert ROW_G + CORE == QKV_ROWS and KPART * KPARTS == HIDDEN and KPART == 4 * COLS
 assert E_UNITS * MAX_ROWS <= NA and K1_ROUNDS * 2 == K1_TPC
@@ -190,18 +232,29 @@ MIN_PER = 8  # pages a live unit at least: one a wave
 
 
 def nsplit(S: int, window: bool) -> int:
-    """N: units a (token, KV head)."""
+    """N: units a (token, KV head), the design's (DESIGN_BC 7.1; a build's
+    own is ``K2Build.nsplit``)."""
     return NSPLIT_SW if window else BLOCKS // (2 * S)
 
 
-def n_units(S: int, window: bool) -> int:
-    """Split units of a launch (CTAs [0, n_units))."""
-    return 2 * S * nsplit(S, window)
+def max_nsplit(S: int) -> int:
+    """The most units a (token, KV head) can have: one unit a CTA."""
+    return BLOCKS // (2 * S)
+
+
+def n_units(S: int, window: bool, n: int = 0) -> int:
+    """Split units of a launch (CTAs [0, n_units)); ``n``: N, 0 the design's."""
+    return 2 * S * (n or nsplit(S, window))
+
+
+def n_comb(S: int) -> int:
+    """Combine CTAs of a launch: one a (token, q head), 16 S."""
+    return HEADS * S
 
 
 def C0(S: int) -> int:
     """The first combine CTA: [C0, BLOCKS) runs one (token, q head) each."""
-    return BLOCKS - 16 * S
+    return BLOCKS - n_comb(S)
 
 
 def split_unit(u: int, n: int) -> tuple[int, int, int]:
@@ -209,7 +262,9 @@ def split_unit(u: int, n: int) -> tuple[int, int, int]:
     return u // (2 * n), (u // n) % 2, u % n
 
 
-def split_plan(L: int, window: bool, n: int) -> tuple[int, int, int, int, int]:
+def split_plan(
+    L: int, window: bool, n: int, min_per: int = MIN_PER
+) -> tuple[int, int, int, int, int]:
     """A (token, KV head)'s pages at context length L (already 0 for a pad
     row and clamped to the table): (lo, b0, nb, per, live). Keys lo <= k < L;
     pages b0 .. b0 + nb; unit p < live covers pages [b0 + p per, min(b0 + (p
@@ -217,7 +272,7 @@ def split_plan(L: int, window: bool, n: int) -> tuple[int, int, int, int, int]:
     lo = max(0, L - WINDOW) if window else 0
     b0 = lo // KV_BLOCK
     nb = (L - 1) // KV_BLOCK - b0 + 1 if L > 0 else 0
-    per = max(-(-nb // n), MIN_PER)
+    per = max(-(-nb // n), min_per)
     return lo, b0, nb, per, -(-nb // per)
 
 
@@ -225,6 +280,138 @@ assert all(
     n_units(s, w) <= BLOCKS and C0(s) >= BLOCKS // 2
     for s in range(1, MAX_ROWS + 1)
     for w in (False, True)
+)
+
+# --------------------------------------------------------------------------
+# K2(split) split / combine retune (TUNE lever L3, DESIGN_BC 12 open question
+# 4): a build's N (``K2Build.split_n``, 0 = ``nsplit``) and its least pages
+# a live unit (``K2Build.split_min_per``, MIN_PER). A preset names a set of
+# them by width and kind (``split_fields``); "+" composes atoms (later atoms
+# win a field); the runtime knob ``mono_split_preset`` picks one per width
+# (default ``DEFAULT_SPLIT_PRESET``). Every value stays within 7.1's
+# invariants: 2 S N <= 256 (a unit a CTA), live = cdiv(nb, per) <= N. A field
+# equal to the design's value is stored as the design default (one build,
+# one key). Measured (MI355X TP8, STATUS_BC 11): "coarse" is never slower
+# than "base" (c8 TPOT -0.4 %, c1 / c4 / 31k context equal), so it is the
+# runtime default; "short" / "narrow" win at <= 2k context (c1 -0.8 %) but
+# cost a full layer ~7.5 us at 31k (c1 +2.2 %).
+#
+#   base    the design: N 16 sliding / 256 // 2S full, MIN_PER 8
+#   short   full N = min(16, 256 // 2S): up to 2k context the same 16 live
+#           units as base (per 8), but only 32 S unit CTAs, so CTAs [32 S,
+#           C0) issue their o_proj weights at entry; past 2k a unit grows
+#           (16 pages a wave at 32k)
+#   wide    sliding N = min(17, 256 // 2S): per = 8 for a whole window (129
+#           pages), so no wave runs a second page (base: per 9, wave 0 two)
+#   coarse  MIN_PER 16 and sliding N 9: two pages a wave (the unit loop holds
+#           two in flight), half the live units -> half the combine's polls
+#           and partials, and 7 fewer unit CTAs a (t, kvh) on sliding layers
+#   narrow  S <= 4: short+wide; S >= 5: coarse (short-context deployments)
+SPLIT_ATOMS = ("base", "short", "wide", "coarse")
+SPLIT_PRESETS = (*SPLIT_ATOMS, "narrow")
+DEFAULT_SPLIT_PRESET = "coarse"  # mono_split_preset's default (measured)
+NARROW_MAX = 4  # "narrow": the widths <= this run short+wide, the rest coarse
+
+
+def _split_atom(atom: str, S: int, window: bool, f: dict) -> None:
+    cap = max_nsplit(S)
+    if atom == "short" and not window:
+        f["split_n"] = min(16, cap)
+    elif atom == "wide" and window:
+        f["split_n"] = min(17, cap)
+    elif atom == "coarse":
+        f["split_min_per"] = 2 * MIN_PER
+        if window:
+            f["split_n"] = min(9, cap)
+
+
+def check_split_preset(preset: str) -> tuple[str, ...]:
+    """``preset``'s atoms ("+"-joined names of SPLIT_PRESETS); ValueError
+    for an unknown one."""
+    if not isinstance(preset, str) or not preset:
+        raise ValueError(f"split preset {preset!r}: a str")
+    atoms = tuple(preset.split("+"))
+    bad = [a for a in atoms if a not in SPLIT_PRESETS]
+    if bad:
+        raise ValueError(f"split preset {preset!r}: {bad} (atoms of {SPLIT_PRESETS})")
+    return atoms
+
+
+def split_fields(preset: str, S: int, window: bool) -> dict:
+    """The K2Build split fields of ``preset`` at width S and kind ``window``
+    (a design value stored as its default: base -> {})."""
+    f: dict = {}
+    for atom in check_split_preset(preset):
+        if atom == "narrow":
+            for a in ("short", "wide") if S <= NARROW_MAX else ("coarse",):
+                _split_atom(a, S, window, f)
+        else:
+            _split_atom(atom, S, window, f)
+    if f.get("split_n") == nsplit(S, window):
+        del f["split_n"]
+    if f.get("split_min_per") == MIN_PER:
+        del f["split_min_per"]
+    return f
+
+
+# --------------------------------------------------------------------------
+# K2(split) o_proj task placement (``K2Build.oproj_issue``; TUNE lever L2,
+# DESIGN_BC 7.2's deferred D4). "late" (7.2): CTA b runs tasks b and b +
+# BLOCKS; a combine CTA issues their weights after its ``crdy`` publish (rule
+# 8), so its 64 KiB stream starts when the core ends (M2's otail: ~2.0 / 2.7 us
+# of tail at S = 1 / 8). "early": the 16 S combine CTAs run no o_proj task.
+# Their 32 S tasks are extra tasks of the CTAs below C0, issued with the CTA's
+# own two at its own issue point (entry for a CTA with no role, after its
+# ``srdy`` publish for a split unit): CTA b < C0 takes moved task e = (C0 - 1
+# - b) + j C0 for slot j < oproj_slots(S) while e < 32 S (the CTAs next to C0
+# first: a sliding build's no-role CTAs, which issue at entry). No CTA polls or
+# publishes with another stage's weights in flight (rule 8 as written), and
+# every task's arithmetic is unchanged (the outputs are bit for bit "late"'s).
+# Measured (STATUS_BC 11): early gains 0.2-0.5 us at width 1 and loses 0.6-0.9
+# us at width 8 (c1 TPOT -0.6 %, c8 +0.5 %), so "late" stays the default.
+OPROJ_ISSUES = ("late", "early")  # K2Build.oproj_issue
+W_O_BYTES = HIDDEN * CORE * 2  # o_proj's bf16 weight a rank (16 MiB)
+
+
+def oproj_moved(S: int) -> int:
+    """The combine CTAs' o_proj tasks an "early" build moves (2 a CTA)."""
+    return 2 * n_comb(S)
+
+
+def oproj_slots(S: int) -> int:
+    """Extra task slots a CTA below C0 holds in an "early" build (1 for S <=
+    5, 2 above)."""
+    return -(-oproj_moved(S) // C0(S))
+
+
+def oproj_moved_task(S: int, e: int) -> int:
+    """Moved task e (0 .. 2 n_comb - 1): combine CTA C0 + e's task C0 + e,
+    then combine CTA C0 + e - n_comb's task BLOCKS + C0 + e - n_comb."""
+    c0, half = C0(S), n_comb(S)
+    return c0 + e if e < half else BLOCKS + c0 + e - half
+
+
+def oproj_tasks(S: int, b: int, issue: str) -> list[int]:
+    """The o_proj tasks CTA b runs, in order, under ``issue``."""
+    if issue not in OPROJ_ISSUES:
+        raise ValueError(f"oproj_issue {issue!r} (one of {OPROJ_ISSUES})")
+    if issue == "late":
+        return [b, b + BLOCKS]
+    c0 = C0(S)
+    if b >= c0:
+        return []
+    out = [b, b + BLOCKS]
+    for j in range(oproj_slots(S)):
+        e = c0 - 1 - b + j * c0
+        if e < oproj_moved(S):
+            out.append(oproj_moved_task(S, e))
+    return out
+
+
+assert W_O_BYTES < 2**31 and all(
+    sorted(t for b in range(BLOCKS) for t in oproj_tasks(s, b, "early"))
+    == list(range(O_TASKS))
+    for s in range(1, MAX_ROWS + 1)
 )
 
 # --------------------------------------------------------------------------
@@ -335,11 +522,27 @@ class K2Build:
     # (C, q = 1 widths).
     core: str = "tensor"
     window: bool = False  # split only: a sliding layer's key window
+    # Opt-in tuning variant (TUNE L2), split only: where the combine CTAs'
+    # o_proj tasks run (OPROJ_ISSUES; "late" is DESIGN_BC 7.2's build)
+    oproj_issue: str = "late"
+    # Tuning variants (TUNE L3), split only (``split_fields``): N, units a
+    # (token, KV head) (0: the design's ``nsplit``), and the least pages a
+    # live unit (the runtime picks them by ``mono_split_preset``)
+    split_n: int = 0
+    split_min_per: int = MIN_PER
 
     def __post_init__(self):
         _check_key(
             self,
-            ("tokens", "fault_rank", "fault_epoch", "fault_slot", "fault_ticks"),
+            (
+                "tokens",
+                "fault_rank",
+                "fault_epoch",
+                "fault_slot",
+                "fault_ticks",
+                "split_n",
+                "split_min_per",
+            ),
             ("window", "debug_dump"),
             range(K2_SLOT0, TAG_SLOTS),
         )
@@ -349,17 +552,71 @@ class K2Build:
             raise ValueError(f"K2Build.core {self.core!r} (one of {K2_CORES})")
         if self.window and self.core != "split":
             raise ValueError(f"K2Build.window with core {self.core!r} (split only)")
+        if type(self.oproj_issue) is not str:
+            raise TypeError(f"K2Build.oproj_issue = {self.oproj_issue!r}: a str")
+        if self.oproj_issue not in OPROJ_ISSUES:
+            raise ValueError(
+                f"K2Build.oproj_issue {self.oproj_issue!r} (one of {OPROJ_ISSUES})"
+            )
+        if self.oproj_issue != "late" and self.core != "split":
+            raise ValueError(
+                f"K2Build.oproj_issue {self.oproj_issue!r} with core "
+                f"{self.core!r} (split only)"
+            )
+        tuned = (self.split_n, self.split_min_per)
+        if tuned != (0, MIN_PER) and self.core != "split":
+            raise ValueError(
+                f"K2Build split_n / split_min_per {tuned} with core "
+                f"{self.core!r} (split only)"
+            )
+        if self.split_n == nsplit(self.tokens, self.window) or not (
+            0 <= self.split_n <= max_nsplit(self.tokens)
+        ):
+            raise ValueError(
+                f"K2Build.split_n {self.split_n} (0: the design's "
+                f"{nsplit(self.tokens, self.window)}, else 1 .. "
+                f"{max_nsplit(self.tokens)} and not the design's)"
+            )
+        if not 1 <= self.split_min_per <= 4096:
+            raise ValueError(f"K2Build.split_min_per {self.split_min_per} (1 .. 4096)")
 
     @property
     def faulty(self) -> bool:
         """The build compiles ``sync.stall`` into its prologue."""
         return self.fault_rank >= 0
 
+    def nsplit(self) -> int:
+        """A split build's N: units a (token, KV head)."""
+        return self.split_n or nsplit(self.tokens, self.window)
+
+    def n_units(self) -> int:
+        """A split build's units (CTAs [0, n_units))."""
+        return 2 * self.tokens * self.nsplit()
+
+    def c0(self) -> int:
+        """A split build's first combine CTA."""
+        return C0(self.tokens)
+
+    def oproj_slots(self) -> int:
+        """Extra o_proj task slots of a CTA below C0 (0 but "early")."""
+        if self.oproj_issue != "early":
+            return 0
+        return oproj_slots(self.tokens)
+
+    def split_suffix(self) -> str:
+        """The symbol's TUNE L3 part: empty for the design's values."""
+        out = f"_n{self.split_n}" if self.split_n else ""
+        return out + (
+            f"_m{self.split_min_per}" if self.split_min_per != MIN_PER else ""
+        )
+
     def kernel_name(self) -> str:
         """The kernel symbol: one per build. A Phase A build ("tensor") keeps
         its Phase A name."""
         if self.core == "split":
             core = "_sw" if self.window else "_full"
+            core += self.split_suffix()
+            core += "" if self.oproj_issue == "late" else "_oe"
         else:
             core = _CORE_SUFFIX[self.core]
         name = f"muse_mono_k2_s{self.tokens}{core}" + _fault_suffix(self)
@@ -380,6 +637,9 @@ class K1Build:
     fault_epoch: int = 0
     fault_slot: int = 0
     fault_ticks: int = 0
+    # Opt-in tuning variant (default: the E3 build): the GEMV task layout
+    # (K1_LAYOUTS)
+    layout: str = "g192"
 
     def __post_init__(self):
         _check_key(
@@ -388,6 +648,10 @@ class K1Build:
             ("rope", "debug_dump"),
             range(K1_SLOT0, K2_SLOT0),
         )
+        if type(self.layout) is not str:
+            raise TypeError(f"K1Build.layout = {self.layout!r}: a str")
+        if self.layout not in K1_LAYOUTS:
+            raise ValueError(f"K1Build.layout {self.layout!r} (one of {K1_LAYOUTS})")
 
     @property
     def faulty(self) -> bool:
@@ -397,7 +661,8 @@ class K1Build:
     def kernel_name(self) -> str:
         """The kernel symbol: one per build."""
         kind = "rope" if self.rope else "nope"
-        name = f"muse_mono_k1_s{self.tokens}_{kind}" + _fault_suffix(self)
+        variant = "" if self.layout == "g192" else f"_{self.layout}"
+        name = f"muse_mono_k1_s{self.tokens}_{kind}{variant}" + _fault_suffix(self)
         return name + ("_dbg" if self.debug_dump else "")
 
 
@@ -542,8 +807,19 @@ SCRATCH_PAIRS_BC = (
     ("crdy", 16 * _MT),  # 16 t + h: combine (t, h)'s xo row published (flag)
 )
 SCRATCH_REGIONS_BC = tuple(n for n, _ in SCRATCH_PAIRS_BC)
-SCRATCH_REGIONS_ALL = SCRATCH_REGIONS + SCRATCH_REGIONS_BC
+# Tuning variants' mailboxes, laid out past every plain region so that no
+# earlier offset (and no earlier build's binary) moves.
+SCRATCH_PAIRS_TAIL = (
+    # K1 r256: ((T*4 + c)*MT + t)*16 + r, up to 4 contributors a tile
+    ("qpart4", QKV_TILES * K1_MAXC_BY_LAYOUT["r256"] * _MT * ROWS),
+)
+SCRATCH_REGIONS_TAIL = tuple(n for n, _ in SCRATCH_PAIRS_TAIL)
+SCRATCH_REGIONS_ALL = SCRATCH_REGIONS + SCRATCH_REGIONS_BC + SCRATCH_REGIONS_TAIL
 K1_REGIONS = ("fss", "nss", "ardy", "qpart")  # K1 puts and polls these
+# ... by K1Build.layout
+K1_REGIONS_BY_LAYOUT = {
+    lay: ("fss", "nss", "ardy", K1_QPART[lay]) for lay in K1_LAYOUTS
+}
 SPLIT_REGIONS = ("srdy", "crdy")  # ... and K2(split) these, past K2_REGIONS
 # Every region a wait record may name (debug.region_ids; ids are name CRCs, so
 # the order is free).
@@ -608,6 +884,7 @@ def scratch_layout() -> dict[str, tuple[int, int]]:
     out.update(pair_layout(SCRATCH_PAIRS_BC, start=_end(out)))
     for name, nbytes, align in SCRATCH_PLAIN_BC:
         out[name] = (_align(_end(out), align), nbytes)
+    out.update(pair_layout(SCRATCH_PAIRS_TAIL, start=_end(out)))
     return out
 
 
@@ -709,6 +986,12 @@ def ardy_pair(j):
 def qpart_pair(T, c, t, r):
     """K1: contributor c's partial of qkv tile T's row r for token t."""
     return ((T * K1_MAXC + c) * _MT + t) * ROWS + r
+
+
+def k1_qpart_pair(layout, T, c, t, r):
+    """K1 ``layout``'s partials region (``K1_QPART``) pair of contributor c's
+    partial of tile T's row r for token t (``qpart_pair`` under g192)."""
+    return ((T * K1_MAXC_BY_LAYOUT[layout] + c) * _MT + t) * ROWS + r
 
 
 def srdy_pair(u):

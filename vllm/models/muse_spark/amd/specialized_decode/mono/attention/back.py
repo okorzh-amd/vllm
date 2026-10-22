@@ -99,10 +99,13 @@ def lds_struct(s: int):
     return BackLds
 
 
-def o_loads(c, task):
+def o_loads(c, task, nbytes=None):
     """o_proj rows 16 task .., this wave's K chunk (one of 8): a lane 64 B of
-    its row (4 dwordx4, nontemporal). Issued before any wait of the CTA."""
-    return gemv.loads(c["lane"], c["wave"], c["args"]["w_o"], task * ROWS, OK)
+    its row (4 dwordx4, nontemporal). Issued before any wait of the CTA.
+    ``nbytes`` (a K2(split) "early" build's extra task): the weight's size, or
+    a uniform 0 for a CTA that holds no such task (zeros, no access)."""
+    w = c["args"]["w_o"]
+    return gemv.loads(c["lane"], c["wave"], w, task * ROWS, OK, nbytes=nbytes)
 
 
 def _check_core(core: str) -> None:

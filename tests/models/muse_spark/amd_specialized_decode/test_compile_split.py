@@ -27,6 +27,7 @@ baseline.
 
 import inspect
 import json
+import os
 
 import pytest
 import regex as re
@@ -83,8 +84,92 @@ SPLIT = [
     spec.K2Build(tokens=1, core="split", fault_ticks=WAIT_TICKS * 3 // 2, **FAULT),
     spec.K2Build(tokens=8, core="split", debug_dump=True),
 ]
+# TUNE L2's opt-in "early" o_proj placement (``K2Build.oproj_issue``): every
+# width and kind, a fault and a debug build
+EARLY = [
+    spec.K2Build(tokens=s, core="split", window=w, oproj_issue="early")
+    for s in range(1, spec.MAX_ROWS + 1)
+    for w in (False, True)
+] + [
+    spec.K2Build(
+        tokens=1,
+        core="split",
+        oproj_issue="early",
+        fault_ticks=WAIT_TICKS * 3 // 2,
+        **FAULT,
+    ),
+    spec.K2Build(tokens=8, core="split", window=True, oproj_issue="early",
+                 debug_dump=True),
+]  # fmt: skip
+
+
+# TUNE L3 review: the "+"-composed presets the GPU tests run beyond the atoms
+# (test_numerics_core's CHAIN_PRESETS / REPLAY_PRESETS)
+TUNED_COMPOSED = ("short+wide",)
+
+
+def _reachable_fields(S: int, window: bool):
+    """Every split field set ``mono_split_preset`` can reach at width S and
+    kind ``window`` (any "+"-composition of the atoms): N from short (full)
+    or wide / coarse (sliding), MIN_PER 8 or 16; design values dropped as
+    ``split_fields`` does."""
+    cap = spec.max_nsplit(S)
+    ns = (min(17, cap), min(9, cap)) if window else (min(16, cap),)
+    for n in (spec.nsplit(S, window), *ns):
+        for mp in (spec.MIN_PER, 2 * spec.MIN_PER):
+            f = {"split_n": n, "split_min_per": mp}
+            if n == spec.nsplit(S, window):
+                del f["split_n"]
+            if mp == spec.MIN_PER:
+                del f["split_min_per"]
+            if f:
+                yield f
+
+
+def _tuned() -> list[spec.K2Build]:
+    """TUNE L3's opt-in split retune builds (``spec.split_fields``): every
+    distinct tuned build of every preset (and of ``TUNED_COMPOSED``) at every
+    width and kind, each "late" and "early" (C0 and N move the placement;
+    every build a GPU test or ``mono_core_oproj`` can run with them), and a
+    fault and a debug build. ``MUSE_GATE_ALL_SPLIT=1``: every field set any
+    preset composition reaches (``_reachable_fields``), both placements."""
+    out: dict[spec.K2Build, None] = {}
+    fsets = []
+    for s in range(1, spec.MAX_ROWS + 1):
+        for w in (False, True):
+            if os.environ.get("MUSE_GATE_ALL_SPLIT") == "1":
+                fsets += [(s, w, f) for f in _reachable_fields(s, w)]
+            for p in (*spec.SPLIT_PRESETS, *TUNED_COMPOSED):
+                fsets.append((s, w, spec.split_fields(p, s, w)))
+    for s, w, f in fsets:
+        if f:
+            for o in spec.OPROJ_ISSUES:
+                key = spec.K2Build(tokens=s, core="split", window=w, oproj_issue=o, **f)
+                out[key] = None
+    out[
+        spec.K2Build(
+            tokens=1,
+            core="split",
+            fault_ticks=WAIT_TICKS * 3 // 2,
+            **spec.split_fields(spec.DEFAULT_SPLIT_PRESET, 1, False),
+            **FAULT,
+        )
+    ] = None
+    out[spec.K2Build(tokens=8, core="split", debug_dump=True, split_min_per=16)] = None
+    return list(out)
+
+
+TUNED = _tuned()
 # the o_proj weight loads a lane issues (``back.o_loads``, 2 tasks x 4 dwordx4)
 O_LOADS = 2 * 4
+
+
+def o_loads(key: spec.K2Build) -> int:
+    """The o_proj weight loads a lane of a CTA below C0 issues: its two
+    tasks', plus an "early" build's extra slots (masked where not held)."""
+    return O_LOADS + 4 * key.oproj_slots()
+
+
 # K2(split)'s LDS at S = 1 (DESIGN_BC 7.7: the split struct, 17,408 B, exceeds
 # every Phase A stage at S <= 4); from S = 5 on the pooler's sets it, as in the
 # tensor build
@@ -224,29 +309,65 @@ def test_split_roles_place_every_unit_and_combine():
     only on units, so with every CTA resident the core cannot deadlock. Every
     CTA's o_proj weights come after its last role stage: at entry (no role),
     after ``srdy`` (a unit), or after ``crdy`` (a combine)."""
+    keys = [
+        spec.K2Build(tokens=s, core="split", window=w, **spec.split_fields(p, s, w))
+        for p in spec.SPLIT_PRESETS
+        for s in range(1, spec.MAX_ROWS + 1)
+        for w in (False, True)
+    ]
+    for key in dict.fromkeys(keys):  # TUNE L3's presets too
+        s, window = key.tokens, key.window
+        n, c0 = key.n_units(), key.c0()
+        assert 0 < n <= spec.BLOCKS and 128 <= c0 < spec.BLOCKS
+        combines = [divmod(b - c0, spec.HEADS) for b in range(c0, spec.BLOCKS)]
+        assert combines == [(t, h) for t in range(s) for h in range(spec.HEADS)]
+        units = [spec.split_unit(u, key.nsplit()) for u in range(n)]
+        assert len(set(units)) == n
+        assert {(t, kvh) for t, kvh, _ in units} == {
+            (t, kvh) for t in range(s) for kvh in range(spec.KV_HEADS)
+        }
+        issue = {}
+        for b in range(spec.BLOCKS):
+            roles = [r for r, on in (("srdy", b < n), ("crdy", b >= c0)) if on]
+            issue[b] = roles[-1] if roles else "entry"
+        # the CTAs that start their weights late (the 7.2 tail): 16 S
+        # combines, plus the split-only units
+        assert sum(v == "crdy" for v in issue.values()) == spec.HEADS * s
+        assert sum(v == "srdy" for v in issue.values()) == max(min(n, c0), 0)
+        # the design's full kinds hold a unit on every CTA but a few (2 S
+        # N <= 256): ``split_roles`` drops the CTA test when n == 256
+        if not window and not key.split_n:
+            assert spec.BLOCKS - n < 2 * s
+
+
+def test_oproj_extra_is_the_spec_placement():
+    """The kernel's slot arithmetic (``layer.oproj_extra``, run on Python
+    ints) is ``spec.oproj_tasks``' placement for every width and CTA, and its
+    task stays in range where a CTA holds none (a masked load's address)."""
     for s in range(1, spec.MAX_ROWS + 1):
-        for window in (False, True):
-            n, c0 = spec.n_units(s, window), spec.C0(s)
-            assert 0 < n <= spec.BLOCKS and 128 <= c0 < spec.BLOCKS
-            combines = [divmod(b - c0, spec.HEADS) for b in range(c0, spec.BLOCKS)]
-            assert combines == [(t, h) for t in range(s) for h in range(spec.HEADS)]
-            units = [spec.split_unit(u, spec.nsplit(s, window)) for u in range(n)]
-            assert len(set(units)) == n
-            assert {(t, kvh) for t, kvh, _ in units} == {
-                (t, kvh) for t in range(s) for kvh in range(spec.KV_HEADS)
-            }
-            issue = {}
-            for b in range(spec.BLOCKS):
-                roles = [r for r, on in (("srdy", b < n), ("crdy", b >= c0)) if on]
-                issue[b] = roles[-1] if roles else "entry"
-            # the CTAs that start their weights late (the 7.2 tail): 16 S
-            # combines, plus the split-only units
-            assert sum(v == "crdy" for v in issue.values()) == spec.HEADS * s
-            assert sum(v == "srdy" for v in issue.values()) == max(min(n, c0), 0)
-            # the full kinds hold a unit on every CTA but a few (2 S N <= 256):
-            # ``split_roles`` drops the CTA test when n == 256
-            if not window:
-                assert spec.BLOCKS - n < 2 * s
+        for b in range(spec.BLOCKS):
+            got = []
+            for j in range(spec.oproj_slots(s)):
+                held, task = layer.oproj_extra(s, b, j)
+                assert 0 <= task < spec.O_TASKS, (s, b, j, task)
+                if held:
+                    got.append(task)
+            want = spec.oproj_tasks(s, b, "early")[2:]
+            assert got == want, (s, b)
+
+
+def test_early_stages():
+    """An "early" build traces one more o_proj ``stage_o`` an extra slot,
+    after the CTA's own two; a "late" build is 7.2's order."""
+    for s in range(1, spec.MAX_ROWS + 1):
+        late = spec.K2Build(tokens=s, core="split")
+        early = spec.K2Build(tokens=s, core="split", oproj_issue="early")
+        assert layer.key_stages(late) == layer.SPLIT_STAGES
+        got = layer.key_stages(early)
+        o = layer.SPLIT_STAGES.index("seam")
+        assert got[:o] == layer.SPLIT_STAGES[:o]
+        assert got[o:] == (back.STAGE,) * spec.oproj_slots(s) + (layer.SPLIT_STAGES[o:])
+    assert layer.key_stages(spec.K2Build(tokens=3)) == layer.STAGES
 
 
 def test_split_builds_are_distinct():
@@ -257,6 +378,8 @@ def test_split_builds_are_distinct():
         spec.K2Build(tokens=2, core="gated"),
         spec.K2Build(tokens=2, core="split"),
         spec.K2Build(tokens=2, core="split", window=True),
+        spec.K2Build(tokens=2, core="split", window=True, split_n=17),
+        spec.K2Build(tokens=2, core="split", split_min_per=16),
     ]
     launches = [layer.build(k) for k in keys]
     assert len({id(f) for f in launches}) == len(keys)
@@ -266,6 +389,8 @@ def test_split_builds_are_distinct():
         "muse_mono_k2_s2_g",
         "muse_mono_k2_s2_full",
         "muse_mono_k2_s2_sw",
+        "muse_mono_k2_s2_sw_n17",
+        "muse_mono_k2_s2_full_m16",
     ]
 
 
@@ -273,14 +398,17 @@ def test_split_builds_are_distinct():
 
 
 @compiles
-@pytest.mark.parametrize("key", SPLIT, ids=lambda k: k.kernel_name())
+@pytest.mark.parametrize("key", SPLIT + EARLY + TUNED, ids=lambda k: k.kernel_name())
 def test_split_builds_compile_without_a_gpu(key, tmp_path, monkeypatch):
     """Every split build passes the ISA gate and keeps 7.2's order (rule 8)
-    and rule 9; the split loop keeps two pages in flight."""
+    and rule 9; the split loop keeps two pages in flight. An "early" build
+    (TUNE L2) the same, its CTAs below C0 issuing their extra slots' weights
+    with their own two tasks' (one issue point, before the crdy poll). A
+    TUNE L3 build (another N / MIN_PER) the same."""
     txt, res = _compile(key, tmp_path, monkeypatch)
     print(f"{key.kernel_name()}: {res}")
     s = key.tokens
-    n = spec.nsplit(s, key.window)
+    n = key.nsplit()
     assert res["private_segment_fixed_size"] == 0, res
     assert VGPR_ONE_CTA < res["next_free_vgpr"] <= spec.VGPR_MAX, res
     assert res["group_segment_fixed_size"] <= spec.LDS_BYTES, res
@@ -322,10 +450,11 @@ def test_split_builds_compile_without_a_gpu(key, tmp_path, monkeypatch):
     stores = _STORE.findall(txt, 0, first_nt)
     assert all(re.search(r"\bsc1\b", st) for st in stores), stores
     assert sum("buffer_store_short" in st for st in stores) == 1  # xo
-    # then the 8 weight loads together, before load_core's first crdy poll
+    # then the 8 weight loads (an "early" build: 8 + 4 an extra slot)
+    # together, before load_core's first crdy poll
     poll = _POLL.search(txt, first_nt)
     assert poll, "no crdy poll after the weights"
-    assert len(_NT_LOAD.findall(txt, first_nt, poll.start())) == O_LOADS
+    assert len(_NT_LOAD.findall(txt, first_nt, poll.start())) == o_loads(key)
     # and the xo rows at device scope (one dwordx4 a thread and round) after
     # the poll, before o_proj's first MFMA
     first_o = _OPROJ_MFMA.search(txt, poll.start())
@@ -354,9 +483,21 @@ def test_split_builds_compile_without_a_gpu(key, tmp_path, monkeypatch):
 @pytest.mark.parametrize(
     "key",
     [
-        spec.K2Build(tokens=s, core="split", window=w)
+        spec.K2Build(tokens=s, core="split", window=w, oproj_issue=o)
         for s in (1, 8)
         for w in (False, True)
+        for o in spec.OPROJ_ISSUES
+    ]
+    + [  # TUNE L3: the default preset ("coarse") and "wide", late and early
+        spec.K2Build(tokens=1, core="split", window=True, split_n=17),
+        spec.K2Build(
+            tokens=8,
+            core="split",
+            window=True,
+            split_n=9,
+            split_min_per=16,
+            oproj_issue="early",
+        ),
     ],
     ids=lambda k: k.kernel_name(),
 )
@@ -376,7 +517,7 @@ def test_split_trace_is_the_program_order(key, tmp_path, monkeypatch):
     monkeypatch.setattr(fx_gpu, "barrier", barrier)
     with plan.recording() as rec:
         _compile(key, tmp_path, monkeypatch)
-    assert tuple(rec.stages) == layer.SPLIT_STAGES, rec.stages
+    assert tuple(rec.stages) == layer.key_stages(key), rec.stages
     assert not rec.unnamed, rec.unnamed
     for i, name in enumerate(rec.stages[:-1]):
         if name not in tc.NO_LDS:

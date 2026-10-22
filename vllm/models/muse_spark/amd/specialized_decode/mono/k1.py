@@ -45,6 +45,16 @@ would let two CTAs share a CU and leave CUs without a GEMV CTA. The
 not an occupancy one (the hardware places by the descriptor's VGPR granules
 and LDS), so it cannot do this. The epilogue and the boundary use no LDS.
 
+Opt-in variants (``K1Build`` fields; the defaults are the E3 build above,
+unchanged): ``layout`` "r256" (M2's 10/6 rebalance, DESIGN_BC 11.3 rung 3)
+also gives each boundary CTA 6 GEMV tasks, run after its slice's ``ardy``
+publish (and before its epilogue), so that no boundary poll or publish waits
+on weights (rule 8: review 1's "issue weights only after the last publish");
+the GEMV CTAs then run 10 tasks each, and the partials go to ``qpart4`` (2
+to 4 contributors a tile). Deadlock freedom is unchanged: a boundary CTA's
+GEMV waits only on ``ardy``, which every boundary CTA publishes before its
+own GEMV.
+
 Adapted from K2 (``mono/layer.py``: the kernel / launcher pair, ``build``,
 ``k2_launch``), with the context built rank-local
 (``make_context(peers=False, route_lds=False)``) and the arguments packed by
@@ -56,6 +66,7 @@ from collections.abc import Mapping
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
+from flydsl.expr import const_expr
 from flydsl.expr.typing import Int32, Int64
 
 from vllm.models.muse_spark.amd.specialized_decode.mono import spec
@@ -117,16 +128,26 @@ class PinLds:
 _STREAM = fx.Stream(None)
 
 
-def lds_structs(s: int) -> dict:
+def max_tasks(layout: str = "g192") -> int:
+    """The most GEMV tasks a CTA of ``layout`` runs (its ``xa`` rows)."""
+    return max(r.n for r in qkv.roles(layout))
+
+
+def lds_structs(s: int, layout: str = "g192") -> dict:
     """The stage union's members at ``s`` rows: the GEMV's staged ``arow``
     rows and the residency pin (no stage touches it)."""
-    return {qkv.STAGE: qkv.lds_struct(s), "pin": PinLds}
+    return {qkv.STAGE: qkv.lds_struct(s, max_tasks(layout)), "pin": PinLds}
 
 
-def lds_bytes(s: int) -> int:
+def lds_bytes(s: int, layout: str = "g192") -> int:
     """K1's static LDS at ``s`` rows: ``red``, then the union (no
     ``RouteLds``). Past ``LDS_BYTES // 2`` at every width."""
-    return lds_total_bytes(lds_structs(s), route_lds=False)
+    return lds_total_bytes(lds_structs(s, layout), route_lds=False)
+
+
+def key_lds_bytes(key: K1Build) -> int:
+    """``lds_bytes`` of build ``key``."""
+    return lds_bytes(key.tokens, key.layout)
 
 
 @traced
@@ -152,6 +173,32 @@ def program(c) -> None:
         qkv.stage_qkv(c, g, wops)
 
 
+@traced
+def program_roles(c, layout: str) -> None:
+    """A layout whose boundary CTAs run GEMV tasks too (r256): on CTA b <
+    NA the boundary (no weight in flight at its polls and its publish), then
+    its role's weights and tasks, then the epilogue (its qpart poll holds
+    only the cos / sin row: every weight has been consumed by the MFMAs);
+    on the GEMV CTAs their weights first, as E3."""
+    s = c["S"]
+    b = c["bid"]
+    b32 = fx.Int32(b)
+    bound, gemv_role = qkv.roles(layout)
+    assert bound.lo == 0 and bound.hi == NA and gemv_role.lo == K1_GEMV0
+    if b < NA:
+        pre = boundary.boundary_loads(c, b)
+        epi = boundary.epilogue_inputs(c, b)
+        boundary.stage_boundary(c, b, pre)
+        wops = qkv.qkv_loads(c, b32, bound)  # past the publish (rule 8)
+        qkv.stage_qkv(c, b32, wops, bound)
+        if b32 < E_UNITS * s:
+            epilogue.stage_epilogue(c, b32, epi)
+    if b >= K1_GEMV0:
+        g = b32 - K1_GEMV0
+        wops = qkv.qkv_loads(c, g, gemv_role)
+        qkv.stage_qkv(c, g, wops, gemv_role)
+
+
 _BUILDS: dict = {}
 
 
@@ -165,11 +212,12 @@ def build(key: K1Build):
     if not isinstance(key, K1Build):
         raise TypeError(f"a K1 build key is a K1Build, not {type(key).__name__}")
     s = key.tokens
-    lds = lds_structs(s)
-    nbytes = lds_bytes(s)
+    lds = lds_structs(s, key.layout)
+    nbytes = lds_bytes(s, key.layout)
     if nbytes > LDS_BYTES:
         raise ValueError(f"K1 at {s} rows: {nbytes} B of LDS > {LDS_BYTES}")
     keyed = key_tuple(key, SOURCES)
+    layout = key.layout
 
     @flyc.kernel(name=key.kernel_name(), known_block_size=[THREADS, 1, 1])
     def k1(
@@ -230,7 +278,10 @@ def build(key: K1Build):
         # rank-local: no peers, no route table; a fault build's sync.stall is
         # make_context's prologue
         c = make_context(s, args, lds, key=key, peers=False, route_lds=False)
-        program(c)
+        if const_expr(layout == "g192"):
+            program(c)
+        else:
+            program_roles(c, layout)
 
     @flyc.jit
     def launch(

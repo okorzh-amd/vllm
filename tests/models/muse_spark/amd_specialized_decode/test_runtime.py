@@ -1861,6 +1861,148 @@ def test_builds_per_width_kind_and_q(front, core, q):
         KernelLayer(bb.layers[1], bb.layers[0], runner, 1, "global")
 
 
+def test_core_oproj_knob():
+    """TUNE L2: ``mono_core_oproj`` ("late" by default, "early" with the
+    split core only) reaches the split builds' key; the q = 8 widths keep the
+    gated core and "late". (The split preset is the default's.)"""
+    cfg = vllm_config()
+    assert layers_mod.decode_phases(cfg).core_oproj == "late"
+    cfg.additional_config = {"mono_core": "split", "mono_core_oproj": "early"}
+    phases = layers_mod.decode_phases(cfg)
+    assert phases == Phases(
+        core="split", core_oproj="early", split_preset=layers_mod.DEFAULT_SPLIT
+    )
+    assert phases.k2_oproj(1) == "early" and phases.k2_oproj(8) == "late"
+    for bad in (
+        {"mono_core_oproj": "early"},  # tensor
+        {"mono_core": "gated", "mono_core_oproj": "early"},
+        {"mono_core": "split", "mono_core_oproj": "soon"},
+        {"mono_core": "split", "mono_core_oproj": 1},
+    ):
+        cfg.additional_config = bad
+        with pytest.raises(ValueError, match="mono_core_oproj"):
+            layers_mod.decode_phases(cfg)
+    bb = _backbone()
+    runner = _Runner([])
+    for q, w in ((1, 1), (1, 8), (8, 8)):
+        for i in (1, 2):
+            kind = _kind(i)
+            k = KernelLayer(bb.layers[i], bb.layers[i - 1], runner, w, kind, q, phases)
+            want = (
+                spec.K2Build(
+                    tokens=w,
+                    core="split",
+                    window=kind == SLIDING,
+                    oproj_issue="early",
+                    **spec.split_fields(spec.DEFAULT_SPLIT_PRESET, w, kind == SLIDING),
+                )
+                if q == 1
+                else spec.K2Build(tokens=w, core="gated")
+            )
+            assert k.key() == want
+
+
+def test_split_preset_knob():
+    """TUNE L3: ``mono_split_preset`` (absent: "coarse" at every width with
+    the split core, the measured default; "base" without it; a preset,
+    "+"-composed, or a dict by width range, widths it leaves out "base";
+    non-base with the split core only) reaches the split builds' key fields
+    (``spec.split_fields`` at the layer's width and kind); q = 8 keeps the
+    gated core; bad values (and the removed comb2 / comb4 / full32) fail at
+    startup."""
+    cfg = vllm_config()
+    assert layers_mod.decode_phases(cfg).split_preset == ("base",) * 8
+    cfg.additional_config = {"mono_core": "gated"}
+    assert layers_mod.decode_phases(cfg).split_preset == ("base",) * 8
+    cfg.additional_config = {"mono_core": "split"}
+    assert layers_mod.decode_phases(cfg).split_preset == ("coarse",) * 8
+    assert layers_mod.DEFAULT_SPLIT == ("coarse",) * 8
+    cfg.additional_config = {"mono_core": "split", "mono_split_preset": "base"}
+    assert layers_mod.decode_phases(cfg) == Phases(core="split")
+    cfg.additional_config = {"mono_core": "split", "mono_split_preset": "short+wide"}
+    assert layers_mod.decode_phases(cfg).split_preset == ("short+wide",) * 8
+    cfg.additional_config = {
+        "mono_core": "split",
+        "mono_split_preset": {"1-4": "short+wide", "6": "narrow", "7-8": "coarse"},
+    }
+    phases = layers_mod.decode_phases(cfg)
+    want = ("short+wide",) * 4 + ("base", "narrow", "coarse", "coarse")
+    assert phases == Phases(core="split", split_preset=want)
+    for bad in (
+        {"mono_split_preset": "short"},  # tensor
+        {"mono_core": "gated", "mono_split_preset": "wide"},
+        {"mono_core": "split", "mono_split_preset": "nope"},
+        {"mono_core": "split", "mono_split_preset": "short+"},
+        {"mono_core": "split", "mono_split_preset": 1},
+        {"mono_core": "split", "mono_split_preset": {"0-2": "short"}},
+        {"mono_core": "split", "mono_split_preset": {"1-9": "short"}},
+        {"mono_core": "split", "mono_split_preset": {"3-2": "short"}},
+        {"mono_core": "split", "mono_split_preset": {"x": "short"}},
+        {"mono_core": "split", "mono_split_preset": {"3-": "short"}},
+        {"mono_core": "split", "mono_split_preset": {"1-4": "short", "4": "wide"}},
+        {"mono_core": "split", "mono_split_preset": {"1": "nope"}},
+        {"mono_core": "split", "mono_split_preset": "comb2"},
+        {"mono_core": "split", "mono_split_preset": "full32"},
+    ):
+        cfg.additional_config = bad
+        with pytest.raises(ValueError, match="mono_split_preset"):
+            layers_mod.decode_phases(cfg)
+    bb = _backbone()
+    runner = _Runner([])
+    for q, w in ((1, 1), (1, 4), (1, 6), (1, 8), (8, 8)):
+        for i in (1, 2):
+            kind = _kind(i)
+            k = KernelLayer(bb.layers[i], bb.layers[i - 1], runner, w, kind, q, phases)
+            if q != 1:
+                assert k.key() == spec.K2Build(tokens=w, core="gated")
+                continue
+            sw = kind == SLIDING
+            want_key = spec.K2Build(
+                tokens=w,
+                core="split",
+                window=sw,
+                **spec.split_fields(phases.split_preset[w - 1], w, sw),
+            )
+            assert k.key() == want_key
+            if w == 1:
+                assert want_key.nsplit() == (17 if sw else 16)
+            if w == 6:  # narrow above width 4: coarse
+                assert want_key.split_min_per == 16 and want_key.c0() == 160
+            if w == 8:
+                assert want_key.split_min_per == 16
+
+
+def test_k1_variant_knobs():
+    """TUNE L1: ``mono_k1_layout`` (default "g192") reaches the K1 builds'
+    keys at every width, only with K1 on; the default keeps the E3 keys."""
+    cfg = vllm_config()
+    assert layers_mod.decode_phases(cfg).k1_layout == "g192"
+    cfg.additional_config = {"mono_front": "k1", "mono_k1_layout": "r256"}
+    phases = layers_mod.decode_phases(cfg)
+    assert phases == Phases("k1", k1_layout="r256")
+    for bad in (
+        {"mono_k1_layout": "r256"},  # the stock front
+        {"mono_front": "k1", "mono_k1_layout": "r192"},
+        {"mono_front": "k1", "mono_k1_layout": None},
+    ):
+        cfg.additional_config = bad
+        with pytest.raises(ValueError, match="decode_backend=auto"):
+            layers_mod.decode_phases(cfg)
+    bb = _backbone()
+    runner = _Runner([])
+    for w in (1, 5, 6, 8):
+        for i in (1, 2):
+            kind = _kind(i)
+            k = KernelLayer(bb.layers[i], bb.layers[i - 1], runner, w, kind, 1, phases)
+            assert k.k1_key() == spec.K1Build(
+                tokens=w, rope=kind == SLIDING, layout="r256"
+            )
+            dflt = KernelLayer(
+                bb.layers[i], bb.layers[i - 1], runner, w, kind, 1, Phases("k1")
+            )
+            assert dflt.k1_key() == spec.K1Build(tokens=w, rope=kind == SLIDING)
+
+
 @pytest.mark.parametrize("core", spec.K2_CORES)
 def test_k1_serves_only_from_its_min_width(monkeypatch, core):
     """DESIGN_BC 11.3 (K1 fails its gate at S = 1, passes at S = 8): with
@@ -2505,6 +2647,17 @@ def test_bind_pins_the_tables_to_mrv2s_buffers(monkeypatch):
         decode._bind_tables(kv_cfg, handles)
 
 
+def _default_split_key(w: int, window: bool) -> spec.K2Build:
+    """The split core's build at width w and kind ``window`` with
+    ``mono_split_preset`` absent (``spec.DEFAULT_SPLIT_PRESET``, "coarse":
+    MIN_PER 16, and N 9 on a sliding layer)."""
+    f = spec.split_fields(spec.DEFAULT_SPLIT_PRESET, w, window)
+    assert f == (
+        {"split_n": 9, "split_min_per": 16} if window else {"split_min_per": 16}
+    )
+    return spec.K2Build(tokens=w, core="split", window=window, **f)
+
+
 def test_executor_k1_split_lifecycle(monkeypatch):
     """K1 + the split core: K1 builds compile before K2's, every layer binds
     its cache, and the self-test runs each kind's first layer ([K1], K2) on a
@@ -2517,11 +2670,12 @@ def test_executor_k1_split_lifecycle(monkeypatch):
         for b in (
             spec.K1Build(tokens=w, rope=False),
             spec.K1Build(tokens=w, rope=True),
-            spec.K2Build(tokens=w, core="split"),
-            spec.K2Build(tokens=w, core="split", window=True),
+            _default_split_key(w, False),
+            _default_split_key(w, True),
         )
     ]
-    assert logs[-1][-3:] == ("k1", 1, "split")
+    assert logs[-2][-4:] == ("k1", 1, "split", "late")
+    assert logs[-1] == (spec.MAX_ROWS, [spec.DEFAULT_SPLIT_PRESET] * spec.MAX_ROWS)
     _bind(bb)
     decode.prepare_kv()
     for by in decode.kernels.values():
@@ -2896,11 +3050,9 @@ def test_executor_split_on_the_stock_front_lifecycle(monkeypatch):
         monkeypatch, extra={"mono_core": "split"}
     )
     assert compiled == [
-        spec.K2Build(tokens=w, core="split", window=window)
-        for w in (1, 2, 3)
-        for window in (False, True)
+        _default_split_key(w, window) for w in (1, 2, 3) for window in (False, True)
     ]
-    assert logs[-1][-3:] == ("stock", 1, "split")
+    assert logs[-2][-4:] == ("stock", 1, "split", "late")
     _bind(bb)
     decode.prepare_kv()
     for by in decode.kernels.values():

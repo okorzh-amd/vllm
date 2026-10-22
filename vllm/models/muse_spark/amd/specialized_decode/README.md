@@ -55,11 +55,31 @@ and are selected in the same `additional_config`, each on its own:
 default), `gated` or `split`.
 
 `mono_core: "gated"` is B2, `mono_front: "k1"` is B1 and `mono_core: "split"` is
-C; `split` serves `q = 1` widths, and DSpark verify widths keep `gated`. With K1
-on, `mono_k1_min_width` (1..8) leaves narrower widths on vLLM's front. An unknown
-value fails at startup, before anything collective runs. A tree without a kernel
-(no `mono/k1.py`, a core missing from `mono.layer.ABI_BY_CORE`) refuses the
+C; `split` serves `q = 1` widths, and DSpark verify widths keep `gated`. The
+tuning options below were measured on MI355X TP8 (see Measured):
+
+| Key | Values (default first) | Selects |
+| --- | --- | --- |
+| `mono_k1_min_width` | 1..8, with `k1` | narrower widths keep vLLM's front |
+| `mono_k1_layout` | `g192` \| `r256`, with `k1` | K1's GEMV task layout: `r256` also gives the 64 boundary CTAs 6 GEMV tasks each (issued after their boundary publish), 10 on each GEMV CTA. Faster at width 1, slower at width 8 |
+| `mono_split_preset` | `coarse` \| `base` \| `short` \| `wide` \| `narrow`, with `split` | the split-KV core's units: `base` is the design's (16 units a (token, KV head) on a sliding layer, 256 / 2S on a full one, at least 8 pages a unit); `coarse` asks for 16 pages a unit (and 9 sliding units: half the combine's polls and partials); `short` caps a full layer at 16 units, `wide` gives a sliding layer 17; `narrow` is `short+wide` up to width 4 and `coarse` above. Presets compose with `+`; a dict picks one by launch width (`{"1-4": "short+wide", "5-8": "coarse"}`, widths it leaves out `base`) |
+| `mono_core_oproj` | `late` \| `early`, with `split` | `early` moves the combine CTAs' o_proj tasks onto the CTAs below them, which issue those weights with their own, so no weight stream starts at the end of the core (bit for bit `late`'s outputs) |
+
+A split preset moves outputs by fp32 rounding only (a different split of the
+same keys). `short` and `narrow` are for short contexts only: a full layer's
+unit grows with the context (+7.5 us a full layer at 31k). An unknown value fails
+at startup, before anything collective runs. A tree without a kernel (no
+`mono/k1.py`, a core missing from `mono.layer.ABI_BY_CORE`) refuses the
 deployment at startup.
+
+The fastest measured configuration for single-stream latency (c1) is
+
+```bash
+--additional-config '{"decode_backend": "latency_specialized",
+  "mono_front": "k1", "mono_core": "split", "mono_k1_layout": "r256"}'
+```
+
+and with the default `g192` layout the same front and core are best at c8.
 
 `VLLM_MOE_SKIP_PADDING=1` is required: the kernels read the step's pad-row mask
 (`forward_context.is_padding`), which Model Runner V2 refreshes every step only
@@ -273,8 +293,10 @@ mono/              kernel source
   DSpark verify widths keep the stock core with the gated core load, since the
   split does not mask causally per query row. DSpark stays supported.
 
-The phases ship independently (Enabling); each is built and CPU-tested, and
-none has yet run on a GPU. `mono/spec.py` holds their whole contract: the build
+The phases ship independently (Enabling); each is CPU-tested and GPU-validated
+on MI355X TP8 (probes against fp64 and the stock kernels, the TP8 layer chain,
+CUDA graph replay, stall / fail-stop, GSM8K parity). `mono/spec.py` holds their
+whole contract: the build
 keys (a `core = "tensor"` key is a Phase A build, with its Phase A name and
 binary), the argument lists, the placements and the scratch layout (B / C
 regions past Phase A's, so every Phase A offset stays; 1.5 MB a rank in all).
@@ -300,7 +322,11 @@ and K2 pairs never alias.
     - CTAs 64-255 run the qkv GEMV (`front/qkv.py`): 12 (tile, 512-column K part)
     tasks each, all their weights in flight from entry, the `arow` rows staged
     into LDS in one pass behind the `ardy` flags. Every tile has two
-    contributors.
+    contributors. `mono_k1_layout: "r256"` (`K1Build.layout`) spreads the 2304
+    tasks over all 256 CTAs: 6 on each boundary CTA, issued only after its
+    slice's `ardy` publish so that no boundary poll waits on weights, and 10 on
+    each GEMV CTA; a tile then has 2 to 4 contributors, summed in a fixed
+    order from `qpart4`.
     - CTAs 0 .. 5S - 1 then run the epilogue (`front/epilogue.py`, 5 CTAs a token,
     a head a wave): it adds the two fp32 partials, rounds to bf16 once and
     reproduces the stock fused QK-norm / RoPE / KV insert's gfx950 arithmetic bit
@@ -319,7 +345,10 @@ and K2 pairs never alias.
   waits on a weight stream; the core load (`split.load_core`) then waits for
   the combine's flags with only those weights in flight. `test_compile_split.py`
   pins that order, the split loop's two pages in flight, device-scope merge
-  loads and no scalar reads of the in-launch regions.
+  loads and no scalar reads of the in-launch regions. A build's units
+  (`K2Build.split_n`, `split_min_per`) come from `mono_split_preset`;
+  `K2Build.oproj_issue = "early"` (`mono_core_oproj`) moves the combine CTAs'
+  o_proj tasks to the CTAs below C0 (`spec.oproj_tasks`).
 
 K1 and the split core read MRV2's persistent metadata buffers (slot mappings,
 block tables, sequence lengths, positions, the pad mask). The KV bind pins each
@@ -335,3 +364,34 @@ reproduces bit for bit, the fused QK-norm / RoPE / KV insert (read from vLLM's
 own code object) and FLA's `rms_norm_gated` (compiled for gfx950), so a
 compiler, Triton or kernel-source change that would alter their rounding fails
 on CPU first.
+
+## Measured
+
+MI355X, TP8, `amd/Muse-Spark-Open-816B-A42B-Quark-MXFP4`, FULL decode CUDA
+graphs. Per-layer serving spans (vLLM profiler, slowest rank, median, attention
+part plus K2, weighted over the 15 full and 45 sliding layers):
+
+| configuration | width 1 | width 8 |
+| --- | --- | --- |
+| A (`--monokernel`) | 80.1 us | 131.9 us |
+| K1 + split, `base` preset | 67.7 us | 119.3 us |
+| K1 + split (default `coarse` preset) + `r256` | 66.4 us | 119.1 us |
+
+Decode TPOT, ms (median of 3 runs; 2k-token prompts, 1k output tokens, or 31k
+prompts; concurrency c), and GSM8K at c8:
+
+| configuration | c1 2k | c4 2k | c8 2k | c1 31k | GSM8K |
+| --- | --- | --- | --- | --- | --- |
+| A | 5.094 | 6.471 | 8.579 | 5.154 | 95.5 |
+| K1 + split, `base` preset | 4.787 | 6.134 | 8.133 | 4.815 | 95.6 |
+| K1 + split (`coarse`) | 4.782 | 6.127 | **8.103** | - | 94.5 |
+| K1 + split (`coarse`) + `r256` | 4.712 | 6.156 | 8.148 | **4.730** | 94.8 |
+| ... + `mono_core_oproj: "early"` | 4.683 | 6.146 | 8.188 | - | 95.3 |
+| K1 + split, `narrow` + `r256` | **4.675** | 6.143 | 8.139 | 4.834 | 95.3 |
+
+GSM8K stays within 1.5 points of Phase A on every configuration (Phase A itself
+measured 94.9 and 95.5 on two runs). `r256` and `early` win at width 1 and lose at
+width 8, so they stay opt-in; `narrow` wins at 2k and loses at 31k. The design's
+per-kernel gates are not all met: K1's front is 13.8 us at width 1 with `r256`
+(stock 18.7 us), and the split core adds 7.1-8.6 us over the gated core at width
+1 (5.8-6.1 us at width 8).

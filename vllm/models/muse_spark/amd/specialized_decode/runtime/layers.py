@@ -59,6 +59,52 @@ TENSOR, GATED, SPLIT = spec.K2_CORES
 # additional_config keys selecting them (with decode_backend), and the narrowest
 # width K1 serves (DESIGN_BC 11.3: K1 only where it passes its gate)
 FRONT_KEY, CORE_KEY, K1_MIN_WIDTH_KEY = "mono_front", "mono_core", "mono_k1_min_width"
+# ... and the split core's o_proj placement (K2Build.oproj_issue, TUNE L2)
+CORE_OPROJ_KEY = "mono_core_oproj"
+# ... and K1's GEMV task layout (K1Build.layout, spec.K1_LAYOUTS; TUNE L1)
+K1_LAYOUT_KEY = "mono_k1_layout"
+# ... and the split core's split / combine retune (TUNE L3; spec.split_fields):
+# a preset name (spec.SPLIT_PRESETS, "+"-composed) at every width, or a dict
+# {"w" or "lo-hi": preset} by launch width (widths it leaves out: "base").
+# Absent: spec.DEFAULT_SPLIT_PRESET at every width (with the split core).
+SPLIT_PRESET_KEY = "mono_split_preset"
+BASE_SPLIT = ("base",) * spec.MAX_ROWS
+DEFAULT_SPLIT = (spec.DEFAULT_SPLIT_PRESET,) * spec.MAX_ROWS
+
+
+def split_presets(value) -> tuple[str, ...]:
+    """``mono_split_preset``'s value -> the preset of widths 1 .. MAX_ROWS.
+    ValueError for an unknown preset, a malformed width or a width named
+    twice."""
+    bad = ValueError(
+        f"Muse Spark specialized decode: {SPLIT_PRESET_KEY} {value!r} (a preset "
+        f"of {spec.SPLIT_PRESETS}, '+'-composed, or a dict of them by width "
+        f"'w' / 'lo-hi' in 1..{spec.MAX_ROWS}; {HINT})"
+    )
+    if isinstance(value, str):
+        items = {f"1-{spec.MAX_ROWS}": value}
+    elif isinstance(value, Mapping):
+        items = dict(value)
+    else:
+        raise bad
+    out: list[str | None] = [None] * spec.MAX_ROWS
+    for rng, preset in items.items():
+        try:
+            spec.check_split_preset(preset)
+            lo, dash, hi = str(rng).partition("-")
+            if dash and not hi:  # "3-": a range needs both ends
+                raise ValueError(rng)
+            lo_i, hi_i = int(lo), int(hi or lo)
+        except ValueError:
+            raise bad from None
+        if not 1 <= lo_i <= hi_i <= spec.MAX_ROWS:
+            raise bad
+        for w in range(lo_i, hi_i + 1):
+            if out[w - 1] is not None:
+                raise bad
+            out[w - 1] = preset
+    return tuple(p or "base" for p in out)
+
 
 # the arguments a launch adds to the layer's static ones, by K2 core
 STEP_ARGS_BY_CORE = {
@@ -96,11 +142,21 @@ class Phases:
     """The kernels serving a kernel layer: ``front`` "stock" (vLLM's) or "k1"
     (B1), ``core`` K2's core at q = 1 widths (``spec.K2_CORES``). With K1 on,
     widths below ``k1_min_width`` keep vLLM's front (the 11.3 cut matrix's "K1
-    only where it wins"). The default is Phase A."""
+    only where it wins"). ``core_oproj``: the split core's o_proj placement
+    (``spec.OPROJ_ISSUES``; "early" needs ``core`` "split"). The default is
+    Phase A. ``split_preset``: the design's split at every width unless
+    given (``decode_phases`` gives the split core ``DEFAULT_SPLIT`` when
+    ``mono_split_preset`` is absent)."""
 
     front: str = STOCK
     core: str = TENSOR
     k1_min_width: int = 1
+    core_oproj: str = "late"
+    # K1's GEMV task layout (TUNE L1; "g192": the E3 build)
+    k1_layout: str = "g192"
+    # the split core's split / combine retune (TUNE L3): a preset a width
+    # (``split_presets``; all "base": the design's N and MIN_PER)
+    split_preset: tuple[str, ...] = BASE_SPLIT
 
     def __post_init__(self):
         if self.front not in FRONTS:
@@ -124,6 +180,43 @@ class Phases:
                 f"Muse Spark specialized decode: {K1_MIN_WIDTH_KEY} {width!r} "
                 f"(an int in 1..{spec.MAX_ROWS}, with {FRONT_KEY} {K1!r}; {HINT})"
             )
+        if self.core_oproj not in spec.OPROJ_ISSUES or (
+            self.core_oproj != "late" and self.core != SPLIT
+        ):
+            raise ValueError(
+                f"Muse Spark specialized decode: {CORE_OPROJ_KEY} "
+                f"{self.core_oproj!r} (one of {spec.OPROJ_ISSUES}; not 'late' "
+                f"only with {CORE_KEY} {SPLIT!r}; {HINT})"
+            )
+        if self.k1_layout not in spec.K1_LAYOUTS or (
+            self.k1_layout != "g192" and self.front != K1
+        ):
+            raise ValueError(
+                f"Muse Spark specialized decode: {K1_LAYOUT_KEY} "
+                f"{self.k1_layout!r} (one of {spec.K1_LAYOUTS}; not 'g192' only "
+                f"with {FRONT_KEY} {K1!r}; {HINT})"
+            )
+        sp = self.split_preset
+        if (
+            not isinstance(sp, tuple)
+            or len(sp) != spec.MAX_ROWS
+            or (sp != BASE_SPLIT and self.core != SPLIT)
+        ):
+            raise ValueError(
+                f"Muse Spark specialized decode: {SPLIT_PRESET_KEY} {sp!r} (one "
+                f"preset a width 1..{spec.MAX_ROWS}; not all 'base' only with "
+                f"{CORE_KEY} {SPLIT!r}; {HINT})"
+            )
+        for p in sp:
+            spec.check_split_preset(p)
+
+    def k2_split(self, q: int, width: int, window: bool) -> dict:
+        """The split core's K2Build split fields at q rows a request and a
+        launch width (``spec.split_fields`` of the width's preset; {} where
+        the split core does not run)."""
+        if self.k2_core(q) != SPLIT:
+            return {}
+        return spec.split_fields(self.split_preset[width - 1], width, window)
 
     def front_at(self, width: int) -> str:
         """The front at a launch width: K1 from ``k1_min_width`` on."""
@@ -133,6 +226,11 @@ class Phases:
         """K2's core at q rows a request: the split core masks no query row
         causally, so a DSpark verify step (q > 1) keeps the gated core load."""
         return GATED if self.core == SPLIT and q != 1 else self.core
+
+    def k2_oproj(self, q: int) -> str:
+        """K2's o_proj placement at q rows a request: the split core's
+        (``core_oproj``) where it runs, else "late"."""
+        return self.core_oproj if self.k2_core(q) == SPLIT else "late"
 
     def reads_kv(self, q: int) -> bool:
         """A kernel reads the KV cache and the per-step metadata (slots, block
@@ -145,14 +243,27 @@ PHASE_A = Phases()
 
 def decode_phases(vllm_config) -> Phases:
     """``additional_config["mono_front"]`` / ``["mono_core"]`` /
-    ``["mono_k1_min_width"]``, Phase A's when absent (or when
-    ``additional_config`` is not a dict)."""
+    ``["mono_k1_min_width"]`` / ``["mono_core_oproj"]`` / ``["mono_k1_layout"]``
+    / ``["mono_split_preset"]``, Phase A's when absent (or when
+    ``additional_config`` is not a dict); with the split core an absent
+    ``mono_split_preset`` is ``spec.DEFAULT_SPLIT_PRESET``."""
     extra = vllm_config.additional_config
     extra = extra if isinstance(extra, dict) else {}
+    core = extra.get(CORE_KEY, TENSOR)
+    preset = extra.get(SPLIT_PRESET_KEY)
     return Phases(
         extra.get(FRONT_KEY, STOCK),
-        extra.get(CORE_KEY, TENSOR),
+        core,
         extra.get(K1_MIN_WIDTH_KEY, 1),
+        extra.get(CORE_OPROJ_KEY, "late"),
+        k1_layout=extra.get(K1_LAYOUT_KEY, "g192"),
+        split_preset=(
+            split_presets(preset)
+            if preset is not None
+            else DEFAULT_SPLIT
+            if core == SPLIT
+            else BASE_SPLIT
+        ),
     )
 
 
@@ -381,7 +492,10 @@ class KernelLayer:
         if self.static_k1 is None:
             return None
         return K1Build(
-            tokens=self.width, rope=self.kind == SLIDING, **self.runner.fault_k1
+            tokens=self.width,
+            rope=self.kind == SLIDING,
+            **self.runner.fault_k1,
+            layout=self.phases.k1_layout,
         )
 
     def key(self) -> K2Build:
@@ -391,6 +505,8 @@ class KernelLayer:
             tokens=self.width,
             core=self.core,
             window=self.core == SPLIT and self.kind == SLIDING,
+            oproj_issue=self.phases.k2_oproj(self.q),
+            **self.phases.k2_split(self.q, self.width, self.kind == SLIDING),
             **self.runner.fault,
         )
 

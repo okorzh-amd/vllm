@@ -46,6 +46,13 @@ a block id passes 4 GiB; LHBNC's head stride is ~5.5 GB) built from
 wave-uniform values, so its buffer resource stays scalar.
 
 The stage uses no LDS (registers and DPP only) and no barrier.
+
+Under the r256 task layout (``K1Build.layout``, ``front/qkv.py``) a tile has
+2 to 4 contributors (``spec.k1_contributors``): a lane polls 4 ``qpart4``
+pairs (the ones past its tile's count repeat the last one) and adds the
+partials in contributor order, x = bf16(((p_0 + p_1) + p_2) + p_3) over the
+tile's contributors only; the order is fixed, so the ranks still agree bit
+for bit.
 """
 
 import flydsl.expr as fx
@@ -74,6 +81,10 @@ from vllm.models.muse_spark.amd.specialized_decode.mono.common.sync import (
 from vllm.models.muse_spark.amd.specialized_decode.mono.spec import (
     E_UNITS,
     HEAD_DIM,
+    K1_MAXC_BY_LAYOUT,
+    K1_QPART,
+    K1_ROLES,
+    KPARTS,
     KV_BLOCK,
     KV_HEADS,
     QKV_ROWS,
@@ -86,12 +97,13 @@ from vllm.models.muse_spark.amd.specialized_decode.mono.spec import (
     ROWS,
     V_OFF,
     WAVES,
+    k1_qpart_pair,
     qkvd_elem,
     qpart_pair,
 )
 
 STAGE = "epilogue"
-STAGE_REGIONS = ("qpart",)  # polls (the GEMV CTAs put)
+STAGE_REGIONS = ("qpart", "qpart4")  # polls its layout's (the GEMV CTAs put)
 
 INPUTS = ("pad", "pos", "slot")  # the ``boundary.epilogue_inputs`` this reads
 INV_D = 2.0**-6  # 1 / HEAD_DIM: the .cu's ``sumsq / 64`` is fma(tot, 2^-6, eps)
@@ -161,18 +173,58 @@ def rope(x, cs, sn, lane):
     return fx.Float32((k8 == 0).select(b - a, (k8 == 7).select(d7, mid)))
 
 
+def n_contributors(layout: str, tile):
+    """How many CTAs hold one of ``tile``'s K parts under ``layout``
+    (``spec.k1_contributors``' count), from the role whose tasks start at or
+    before the tile's first: Python ints (host) or traced Int32 alike."""
+    n = None
+    for _, _, per, tau0 in K1_ROLES[layout]:
+        lo = KPARTS * tile - tau0
+        cnt = (lo + KPARTS - 1) // per - lo // per + 1
+        n = cnt if n is None else sel(KPARTS * tile >= tau0, cnt, n)
+    return n
+
+
+def _partials(c, layout, tile, t, r16):
+    """The fp32 sum of row r16 of ``tile``'s contributors' partials for token
+    t, in contributor order (``layout`` past E3: up to 4, module docstring)."""
+    scr = c["scr"]
+    if layout == "g192":
+        got = c["poll"](
+            [
+                (scr["qpart"], qpart_pair(tile, 0, t, r16), 1),
+                (scr["qpart"], qpart_pair(tile, 1, t, r16), 1),
+            ]
+        )
+        return got[0][0].bitcast(fx.Float32) + got[1][0].bitcast(fx.Float32)
+    region = scr[K1_QPART[layout]]
+    maxc = K1_MAXC_BY_LAYOUT[layout]
+    n = n_contributors(layout, tile)
+    specs = []
+    for cc in range(maxc):
+        ci = cc if cc < 2 else fx.min(n - 1, fx.Int32(cc))  # every tile has >= 2
+        specs.append((region, k1_qpart_pair(layout, tile, ci, t, r16), 1))
+    got = c["poll"](specs)
+    v = got[0][0].bitcast(fx.Float32) + got[1][0].bitcast(fx.Float32)
+    for cc in range(2, maxc):
+        v = fx.Float32((n > cc).select(v + got[cc][0].bitcast(fx.Float32), v))
+    return v
+
+
 def stage_epilogue(c, u, inputs) -> None:
-    """Unit u (module docstring): ``qpart`` -> ``qkvo`` (and ``qkvd`` in a
+    """Unit u (module docstring): the partials -> ``qkvo`` (and ``qkvd`` in a
     debug build), the k / v heads into the cache. RoPE iff the context's
-    build key is a ``K1Build`` with ``rope``."""
+    build key is a ``K1Build`` with ``rope``; the partials region and count
+    by its ``layout``."""
     enter_stage(STAGE)
     key = c["key"]
     rope_on = bool(getattr(key, "rope", False))
-    _stage(c, u, inputs, rope_on, c["debug_dump"])
+    layout = getattr(key, "layout", "g192")
+    _stage(c, u, inputs, rope_on, c["debug_dump"], layout)
 
 
 @traced
-def _stage(c, u, inputs, rope_on, debug_dump):
+def _stage(c, u, inputs, rope_on, debug_dump, layout="g192"):
     lane = c["lane"]
     a, scr = c["args"], c["scr"]
     t = u // E_UNITS
@@ -191,13 +243,7 @@ def _stage(c, u, inputs, rope_on, debug_dump):
     if live:
         tile = row // ROWS
         r16 = row % ROWS
-        got = c["poll"](
-            [
-                (scr["qpart"], qpart_pair(tile, 0, t, r16), 1),
-                (scr["qpart"], qpart_pair(tile, 1, t, r16), 1),
-            ]
-        )
-        x = bf16_round(got[0][0].bitcast(fx.Float32) + got[1][0].bitcast(fx.Float32))
+        x = bf16_round(_partials(c, layout, tile, t, r16))
         if const_expr(debug_dump):
             bo.buffer_store(x.to(fx.BFloat16), rsrc(scr[QKVD]), qkvd_elem(t, row))
         y = qk_norm(x, lane)

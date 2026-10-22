@@ -37,6 +37,7 @@ stock front (boundary + qkv GEMM + insert) in CUDA graphs, rotating 8 weight
 sets; printed only (the B1 gate is a serving span, DESIGN_BC 11.2).
 """
 
+import os
 from types import SimpleNamespace
 
 import pytest
@@ -59,6 +60,35 @@ f32 = torch.float32
 H, CORE, QKV, MT = spec.HIDDEN, spec.CORE, spec.QKV_ROWS, spec.MAX_TOKENS
 STALLED = tn.STALLED
 WIDTHS = (1, 3, 8)
+# TUNE L1: the K1 tuning variant (``K1Build.layout``) the K1 builds here use:
+# MUSE_K1_LAYOUT, read at call time in each Ray worker (a local Ray cluster's
+# workers inherit the driver's environment as of ``ray.init``); the default
+# is the E3 build. The ``*_k1_variant`` / ``*_r256`` tests set it; set by
+# hand it moves every test here.
+K1_VARIANT_ENV = {"layout": "MUSE_K1_LAYOUT"}
+K1_VARIANT_DEFAULT = {"layout": "g192"}
+# the non-default layouts the TP8 chain runs
+K1_VARIANTS = ("r256",)
+
+
+def _k1_variant() -> dict:
+    """This process's K1 variant fields (``K1Build`` keyword arguments)."""
+    return {
+        f: os.environ.get(e, K1_VARIANT_DEFAULT[f]) for f, e in K1_VARIANT_ENV.items()
+    }
+
+
+def _use_k1_variant(monkeypatch: pytest.MonkeyPatch, layout: str) -> None:
+    """Select a K1 variant for this test's Ray workers (before ``ray.init``)."""
+    monkeypatch.setenv(K1_VARIANT_ENV["layout"], layout)
+
+
+def _k1_regions() -> re.Pattern:
+    """A given-up wait record on one of this variant's K1 regions."""
+    names = spec.K1_REGIONS_BY_LAYOUT[_k1_variant()["layout"]]
+    return re.compile(rf": ({'|'.join(names)}) pair")
+
+
 KINDS = ("sliding", "full")
 # the kernel layer each kind runs as: layer 1 is full, 2 sliding (DESIGN_BC
 # 3.1), so each has its own K1 / K2 tag slots
@@ -93,7 +123,6 @@ K1_WEIGHTS = (
     "cos_sin",
     "max_pos",
 )
-K1_REGIONS = re.compile(rf": ({'|'.join(spec.K1_REGIONS)}) pair")
 
 needs_gfx950 = tn.needs_gfx950
 
@@ -230,6 +259,28 @@ def test_cases_hold_what_they_claim():
     assert max(big.lens) > spec.WINDOW and spec.WINDOW in big.lens
     assert any(L % spec.KV_BLOCK == 0 for L in big.lens)
     assert any(L % spec.KV_BLOCK == 1 for L in big.lens)  # a new page
+
+
+def test_k1_variant_selection(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The variant tests' plumbing: unset, the E3 build; each parametrized
+    variant a valid, distinct K1 build whose stall regex names its own
+    partials region."""
+    for e in K1_VARIANT_ENV.values():
+        monkeypatch.delenv(e, raising=False)
+    assert _k1_variant() == K1_VARIANT_DEFAULT
+    assert spec.K1Build(tokens=1, rope=True, **_k1_variant()) == spec.K1Build(1, True)
+    assert _k1_regions().search("x: qpart pair 3")
+    names = set()
+    for layout in K1_VARIANTS:
+        _use_k1_variant(monkeypatch, layout)
+        key = spec.K1Build(tokens=8, rope=False, **_k1_variant())
+        assert key.layout == layout
+        names.add(key.kernel_name())
+        part = spec.K1_QPART[layout]
+        assert _k1_regions().search(f"x: {part} pair 3")
+        if layout == "r256":
+            assert not _k1_regions().search("x: qpart pair 3")
+    assert len(names) == len(K1_VARIANTS)
 
 
 def test_k1_launch_carries_the_abi():
@@ -477,7 +528,9 @@ def _chain(runner, w, fw, table, kv, case, window, branch, stream, *, dump=False
     qkvo, attn, stream_out, branch_out)."""
     S, dev = case.S, stream.device
     layer_idx = LAYER["sliding" if window else "full"]
-    key = spec.K1Build(tokens=S, rope=window, debug_dump=dump, **runner.fault_k1)
+    key = spec.K1Build(
+        tokens=S, rope=window, debug_dump=dump, **runner.fault_k1, **_k1_variant()
+    )
     runner.step_begin()
     stream_k1, qkvo = _k1(
         runner, fw, kv, case, branch, stream, spec.k1_slot(layer_idx), key
@@ -530,6 +583,8 @@ def _chain_worker(
     from vllm.models.muse_spark.amd.specialized_decode.runtime.runner import MonoRunner
 
     runner = MonoRunner(device)
+    if rank == 0:
+        print(f"K1 variant {_k1_variant()}", flush=True)
     # the first launch of each build compiles it: the startup budget
     runner.set_wait_budget(STARTUP_WAIT_SECONDS)
     w = tn._weights(rank, device)
@@ -696,7 +751,7 @@ def _stall_worker(
     with tn._tp_checks("the stalled K1"):
         assert gave_up.item() > 0, "no rank's wait gave up"
         if rank == STALLED:
-            assert any(K1_REGIONS.search(x) for x in waits), waits
+            assert any(_k1_regions().search(x) for x in waits), waits
             # FAILED before the epilogue's insert: not one K / V byte moved
             assert torch.equal(_bits(kv), _bits(before))
         else:
@@ -708,6 +763,28 @@ def _stall_worker(
 @needs_gfx950
 @multi_gpu_test(num_gpus=8)
 def test_stalled_k1_fails_without_a_hang(monkeypatch: pytest.MonkeyPatch) -> None:
+    multi_process_parallel(monkeypatch, 8, 1, _stall_worker)
+
+
+@needs_gfx950
+@multi_gpu_test(num_gpus=8)
+@pytest.mark.parametrize("layout", K1_VARIANTS)
+def test_layer_chain_k1_variant(monkeypatch: pytest.MonkeyPatch, layout: str) -> None:
+    """``test_layer_chain`` on a K1 tuning variant (TUNE L1): the r256 layout
+    (boundary CTAs run 6 GEMV tasks past their publish; 2 to 4 contributors a
+    tile in ``qpart4``), at every width and kind, pad rows, the NaN pad rows
+    and a CUDA graph of two widths."""
+    _use_k1_variant(monkeypatch, layout)
+    multi_process_parallel(monkeypatch, 8, 1, _chain_worker)
+
+
+@needs_gfx950
+@multi_gpu_test(num_gpus=8)
+def test_stalled_k1_fails_without_a_hang_r256(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The stall test on the r256 layout, whose stalled CTA 0 also runs GEMV
+    tasks and an epilogue unit: every launch returns, a ``qpart4`` / ``ardy``
+    / ``fss`` / ``nss`` wait gives up, the stalled rank inserts nothing."""
+    _use_k1_variant(monkeypatch, "r256")
     multi_process_parallel(monkeypatch, 8, 1, _stall_worker)
 
 
@@ -749,7 +826,7 @@ def _speed_worker(
     for S, gate in ((1, 0.70), (8, 0.6)):
         case = _case(S, device=device)
         branch, stream = _step_inputs(device, S)
-        key = spec.K1Build(tokens=S, rope=True)
+        key = spec.K1Build(tokens=S, rope=True, **_k1_variant())
         runner.set_wait_budget(STARTUP_WAIT_SECONDS)
         mono = (runner, sets, case, branch, stream, key)
         stock = (sets, rope, case, branch, stream)

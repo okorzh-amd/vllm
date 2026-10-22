@@ -5,7 +5,7 @@ split-KV GQA decode core for the q = 1 widths, and the core load that reads
 the combine's gated rows.
 
     split       one unit a CTA: unit u = (t 2 + kvh) N + p (``spec.split_unit``,
-                N = ``spec.nsplit(S, window)``) attends token t's 8 q heads of
+                N = ``K2Build.nsplit()``) attends token t's 8 q heads of
                 KV head kvh over part p of its pages, flash-decoding style ->
                 its unnormalized partial ``opart`` and (max, sum) ``pstat``
                 (fp32, device scope), then the ``srdy`` flag of u
@@ -17,7 +17,8 @@ Keys, from the layer's KV group (``block_table``, ``seq_lens``) and kind
 (``K2Build.window``), all in-kernel: L = ``seq_lens[t]`` clamped to the
 table's row (0 on a pad row), keys lo <= k < L with lo = L - WINDOW on a
 sliding layer (else 0); pages b0 = lo // 16 .. (L - 1) // 16, nb of them, cut
-into N parts of ``per = max(cdiv(nb, N), MIN_PER)`` pages: the combine's own
+into N parts of ``per = max(cdiv(nb, N), MIN_PER)`` pages (the build's N and
+``K2Build.split_min_per``): the combine's own
 ``unit_plan`` (pinned to ``spec.split_plan``), so a unit holds keys iff the
 combine waits for it (p < live).
 Pages outside [b0, b0 + nb) are never read: a sliding group's table nulls only
@@ -93,6 +94,7 @@ from vllm.models.muse_spark.amd.specialized_decode.mono.spec import (
     HEADS,
     KV_BLOCK,
     KV_HEADS,
+    MIN_PER,
     OPART,
     PSTAT,
     Q_PER_KV,
@@ -102,7 +104,6 @@ from vllm.models.muse_spark.amd.specialized_decode.mono.spec import (
     XO,
     K2Build,
     crdy_pair,
-    nsplit,
     opart_word,
     pstat_word,
     srdy_pair,
@@ -139,12 +140,18 @@ def lds_struct(s: int):
     return SplitLds
 
 
-def window_of(c) -> bool:
-    """The build's key window (``K2Build.window``: sliding keys), static."""
+def key_of(c) -> K2Build:
+    """The build's key, a K2Build(core="split") (its window, N and MIN_PER
+    are static)."""
     key = c.get("key")
     if not isinstance(key, K2Build) or key.core != "split":
         raise ValueError(f"the split core needs a K2Build(core='split') key: {key!r}")
-    return key.window
+    return key
+
+
+def window_of(c) -> bool:
+    """The build's key window (``K2Build.window``: sliding keys), static."""
+    return key_of(c).window
 
 
 def entry_loads(c, t, kvh) -> dict:
@@ -169,12 +176,12 @@ def row_len(c, t, pre):
     return pad_t.select(fx.Int32(0), L)
 
 
-def pages(L, window: bool, n: int, p):
+def pages(L, window: bool, n: int, p, min_per: int = MIN_PER):
     """Part p of N = ``n`` at context length L: (lo, pa, pe), keys lo <= k <
     L, pages [pa, pe), empty when pe <= pa (p >= the combine's live). The
     combine's ``unit_plan``; Python ints or traced Int32 (the CPU test runs
     this very function against ``spec.split_plan``)."""
-    lo, b0, nb, per, _ = unit_plan(L, window, n)
+    lo, b0, nb, per, _ = unit_plan(L, window, n, min_per)
     pa = b0 + p * per
     pe = sel(pa + per < b0 + nb, pa + per, b0 + nb)
     return lo, pa, pe
@@ -333,11 +340,11 @@ def stage_split(c, u):
     8 .., ``pstat`` (m, l) of its 8 q heads, then ``srdy[u]``. Polls nothing;
     ends with ``publish``'s barrier (the LDS hand-over)."""
     enter_stage(STAGE)
-    s, tid, lane = c["S"], c["tid"], c["lane"]
+    tid, lane = c["tid"], c["lane"]
     a, scr = c["args"], c["scr"]
     sl = c["lds"]["split"]
-    window = window_of(c)
-    n = nsplit(s, window)
+    key = key_of(c)
+    window, n = key.window, key.nsplit()
     u = fx.Int32(u)
     t = u // (2 * n)
     kvh = (u // n) % KV_HEADS
@@ -350,7 +357,7 @@ def stage_split(c, u):
     pre = entry_loads(c, t, kvh)
     rocdl.sched_barrier(0)
     L = row_len(c, t, pre)
-    lo, pa, pe = pages(L, window, n, p)
+    lo, pa, pe = pages(L, window, n, p, key.split_min_per)
     nw = (fx.max(pe - pa - wave, 0) + (WAVES - 1)) // WAVES  # this wave's pages
     base = pa + wave
     bid = _bid_chunk(c, t, pa, pe, wave, 0)

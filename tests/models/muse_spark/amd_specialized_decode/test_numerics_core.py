@@ -41,10 +41,28 @@ captured decode does), captured on the persistent buffers; between
 replays the host advances ``seq_lens``, positions, slots and the block tables
 as MRV2 does (crossing pages and the sliding window); every replay equals an
 eager run of the same step on the same contents, 300 replays, health zero.
+
+[TP8] ``test_layer_chain_split_oproj_early`` / ``test_graph_replay_oproj_early``
+(TUNE L2, ``K2Build.oproj_issue="early"``: the combine CTAs' o_proj tasks run
+on the CTAs below C0): the chain test's checks on the "early" build, plus
+``stream_out``, ``branch_out`` and ``xo`` bit for bit a "late" launch on the
+same inputs (every task's arithmetic is unchanged, only its CTA moves); the
+replay test with the "early" build in the split graph.
+``test_split_oproj_early_every_width``: "early" vs "late" bit for bit at
+every width 1..8 and both kinds (``EARLY_CASES``).
+
+[TP8] ``test_layer_chain_split_preset`` (TUNE L3, ``mono_split_preset``: the
+split core's N and MIN_PER; "coarse" is the runtime default): the chain
+test's checks on each ``CHAIN_PRESETS`` build. ``test_split_presets_every_width``:
+every width and kind, each ``WIDTH_PRESETS`` build's xo within the core
+targets of the design's split build, its "early" build bit for bit its
+"late" one. ``test_graph_replay_split_preset``: the replay test on
+``REPLAY_PRESETS`` builds.
 """
 
 import importlib.util
 import math
+import os
 from types import SimpleNamespace
 
 import pytest
@@ -95,6 +113,22 @@ CASES = (
     ((2049, 17, 2064), 3),
     ((1, 16, 257, 2047, 2050, 4103), 8),
     ((32773, 2048, 2063, 17, 3000, 2, 4112, 900), 8),
+)
+# TUNE L2's early-vs-late launches: every width (S = 6, 7 hold their second
+# extra slot on part of the CTAs below C0, S = 8 on all; S = 5 puts extras on
+# seam CTAs), pad rows at S = 2, 5, 7, a context past 32k at S = 1 and 6
+EARLY_CASES = tuple(
+    (lens[:n], S)
+    for lens, n, S in (
+        ((32773,), 1, 1),
+        ((2065, 17), 1, 2),
+        ((2049, 17, 2064), 3, 3),
+        ((1, 16, 257, 4103), 4, 4),
+        ((2047, 2050, 900, 3000), 4, 5),
+        ((32773, 2048, 2063, 17, 3000, 2), 6, 6),
+        ((4112, 900, 1, 16, 257, 2047), 6, 7),
+        ((17, 2065, 2049, 1, 16, 257, 4103, 2050), 8, 8),
+    )
 )
 # the replay graph's two requests: request 0 crosses the window (and a page
 # every 16 steps), request 1 is past it from the start
@@ -365,15 +399,45 @@ def _k2(runner, w, key, core_args, stream, pad, kind):
     return stream_out, branch_out
 
 
-def _split_step(front, runner, w, fw, kind, branch, stream, step, kv, *, begin=True):
+def _split_key(
+    S: int, kind: str, oproj: str = "late", preset: str = "base"
+) -> spec.K2Build:
+    """The split build of width S and ``kind``: ``oproj`` its
+    ``oproj_issue``, ``preset`` its TUNE L3 split preset (``split_fields``)."""
+    sw = kind == SLIDING
+    return spec.K2Build(
+        tokens=S,
+        core="split",
+        window=sw,
+        oproj_issue=oproj,
+        **spec.split_fields(preset, S, sw),
+    )
+
+
+def _split_step(
+    front,
+    runner,
+    w,
+    fw,
+    kind,
+    branch,
+    stream,
+    step,
+    kv,
+    *,
+    begin=True,
+    oproj="late",
+    preset="base",
+):
     """``step_begin; front; K2(split)`` of one layer: (stream_out, branch_out,
-    qkvo)."""
+    qkvo). ``oproj``: the build's ``oproj_issue``; ``preset``: its split
+    preset (TUNE L3)."""
     S = branch.shape[0]
     if begin:
         runner.step_begin()
     s1, qkvo = _front(front, runner, fw, kind, branch, stream, step, kv)
     md = step.attn_metadata[NAME[kind]]
-    key = spec.K2Build(tokens=S, core="split", window=kind == SLIDING)
+    key = _split_key(S, kind, oproj, preset)
     out = _k2(runner, w, key, _split_args(qkvo, kv, md), s1, step.pad, kind)
     return (*out, qkvo)
 
@@ -426,6 +490,51 @@ def test_cases_make_the_edges_bite():
         pages = _pages(c, need + 8, 0)
         flat = [b for row in pages for b in row]
         assert len(set(flat)) == len(flat) and 0 not in flat
+
+
+def test_early_cases_cover_every_placement():
+    """TUNE L2's early-vs-late cases: every width once (so every extra-slot
+    count, a slot held by part of the CTAs below C0 and one held by all, and
+    extras on seam CTAs), pad rows, a context past 32k, distinct pages."""
+    assert [w for _, w in EARLY_CASES] == list(range(1, spec.MAX_ROWS + 1))
+    assert any(len(c) < w for c, w in EARLY_CASES)
+    assert max(L for c, _ in EARLY_CASES for L in c) > 32768
+    held = {
+        (w, j): sum(
+            j + 2 < len(spec.oproj_tasks(w, b, "early")) for b in range(spec.BLOCKS)
+        )
+        for _, w in EARLY_CASES
+        for j in range(spec.oproj_slots(w))
+    }
+    assert any(0 < n < spec.C0(w) for (w, j), n in held.items() if j == 1)
+    assert any(n == spec.C0(w) for (w, j), n in held.items() if j == 1)
+    for c, w in EARLY_CASES:
+        assert 1 <= len(c) <= w <= spec.MAX_ROWS
+        assert -(-max(c) // spec.KV_BLOCK) <= MAX_BLOCKS
+        need = sum(-(-L // spec.KV_BLOCK) for L in c)
+        pages = _pages(c, need + 8, 0)
+        flat = [b for row in pages for b in row]
+        assert len(set(flat)) == len(flat) and 0 not in flat
+
+
+def test_presets_run_tuned_builds():
+    """TUNE L3: every TP8 preset is valid and tunes a build at some width the
+    chain (CASES) or the every-width test (EARLY_CASES) runs; the default
+    preset runs in the chain under both o_proj placements."""
+    for p, _ in CHAIN_PRESETS:
+        spec.check_split_preset(p)
+        tuned = [
+            S for _, S in CASES for w in (False, True) if spec.split_fields(p, S, w)
+        ]
+        assert tuned, p
+    assert {(spec.DEFAULT_SPLIT_PRESET, o) for o in spec.OPROJ_ISSUES} <= set(
+        CHAIN_PRESETS
+    )
+    assert spec.DEFAULT_SPLIT_PRESET in WIDTH_PRESETS
+    for p in WIDTH_PRESETS:
+        assert any(
+            spec.split_fields(p, S, w) for _, S in EARLY_CASES for w in (False, True)
+        )
 
 
 def test_replay_schedule_crosses_a_page_and_the_window():
@@ -616,7 +725,16 @@ def _check_chain(runner, w, kind, case, gated, split, s_front, step, kvs):
     tn._all_ranks_equal(bs, f"branch_out ({where})")
 
 
-def _chain(front, monkeypatch, tp_size, pp_size, rank, distributed_init_port):
+def _chain(
+    front,
+    monkeypatch,
+    tp_size,
+    pp_size,
+    rank,
+    distributed_init_port,
+    oproj="late",
+    preset="base",
+):
     device = tn._init_worker(monkeypatch, tp_size, pp_size, rank, distributed_init_port)
 
     from vllm.models.muse_spark.amd.specialized_decode.runtime.runner import MonoRunner
@@ -641,18 +759,46 @@ def _chain(front, monkeypatch, tp_size, pp_size, rank, distributed_init_port):
                 front, runner, w, fw, kind, branch, stream, step, kvs[0]
             )
             ss, bs, qkvo_s = _split_step(
-                front, runner, w, fw, kind, branch, stream, step, kvs[1]
+                front,
+                runner,
+                w,
+                fw,
+                kind,
+                branch,
+                stream,
+                step,
+                kvs[1],
+                oproj=oproj,
+                preset=preset,
             )
             torch.accelerator.synchronize()
             split = (ss, bs, qkvo_s, _xo(runner, S))
             _check_chain(runner, w, kind, (lens, S), gated, split, gated[4], step, kvs)
+            md = step.attn_metadata[NAME[kind]]
+            if oproj != "late":
+                # TUNE L2: the "late" build on the same inputs, bit for bit
+                runner.step_begin()
+                late = _k2(
+                    runner,
+                    w,
+                    _split_key(S, kind, preset=preset),
+                    _split_args(qkvo_s, kvs[1], md),
+                    gated[4],
+                    step.pad,
+                    kind,
+                )
+                torch.accelerator.synchronize()
+                tn._assert_healthy(runner)
+                with tn._tp_checks(f"{kind} {lens} S={S}: {oproj} vs late"):
+                    assert torch.equal(late[0], ss), "stream_out"
+                    assert torch.equal(late[1], bs), "branch_out"
+                    assert torch.equal(_xo(runner, S), split[3]), "xo"
             if len(lens) == S:
                 continue
             # NaN in the pad rows' qkv rows: nothing else moves
             dirty = qkvo_s.clone()
             dirty[step.pad] = float("nan")
-            md = step.attn_metadata[NAME[kind]]
-            key = spec.K2Build(tokens=S, core="split", window=kind == SLIDING)
+            key = _split_key(S, kind, oproj, preset)
             runner.step_begin()
             again = _k2(
                 runner, w, key, _split_args(dirty, kvs[1], md), gated[4], step.pad, kind
@@ -683,7 +829,242 @@ def test_layer_chain_split(front: str, monkeypatch: pytest.MonkeyPatch) -> None:
     multi_process_parallel(monkeypatch, 8, 1, worker)
 
 
-def _replay(front, monkeypatch, tp_size, pp_size, rank, distributed_init_port):
+@ray.remote(num_gpus=1, max_calls=1)
+def _chain_stock_early_worker(
+    monkeypatch, tp_size, pp_size, rank, distributed_init_port
+):
+    _chain("stock", monkeypatch, tp_size, pp_size, rank, distributed_init_port, "early")
+
+
+@ray.remote(num_gpus=1, max_calls=1)
+def _chain_k1_early_worker(monkeypatch, tp_size, pp_size, rank, distributed_init_port):
+    _chain("k1", monkeypatch, tp_size, pp_size, rank, distributed_init_port, "early")
+
+
+@needs_gfx950
+@multi_gpu_test(num_gpus=8)
+@pytest.mark.parametrize(
+    "front", ["stock", pytest.param("k1", marks=needs_k1)], ids=["stock", "k1"]
+)
+def test_layer_chain_split_oproj_early(
+    front: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    worker = _chain_k1_early_worker if front == "k1" else _chain_stock_early_worker
+    multi_process_parallel(monkeypatch, 8, 1, worker)
+
+
+def _early_vs_late(monkeypatch, tp_size, pp_size, rank, distributed_init_port):
+    """TUNE L2: at every width and kind, the "early" K2(split) build's
+    ``stream_out``, ``branch_out`` and ``xo`` bit for bit the "late" build's
+    on the same front rows and cache (each o_proj task's arithmetic is
+    unchanged, only its CTA moves); no wait gave up."""
+    device = tn._init_worker(monkeypatch, tp_size, pp_size, rank, distributed_init_port)
+
+    from vllm.models.muse_spark.amd.specialized_decode.runtime.runner import MonoRunner
+
+    runner = MonoRunner(device)
+    runner.set_wait_budget(STARTUP_WAIT_SECONDS)
+    w = tn._weights(rank, device)
+    fw = _front_weights(rank, device)
+    mrv2 = _fake_mrv2(device)
+    for ci, (lens, S) in enumerate(EARLY_CASES):
+        need = sum(-(-L // spec.KV_BLOCK) for L in lens)
+        nblocks = need + 64
+        pages = _pages(lens, nblocks, 200 + ci)
+        step = mrv2.step(list(lens), {FULL: pages, SLIDING: pages}, S)
+        branch, stream = _boundary_inputs(device, S, 70 + ci)
+        for kind in KINDS:
+            g = torch.Generator().manual_seed(2000 * ci + 7 * rank + LAYER[kind])
+            kv = ref.kv_cache(nblocks, device=device, generator=g)
+            md = step.attn_metadata[NAME[kind]]
+            runner.step_begin()
+            s1, qkvo = _front("stock", runner, fw, kind, branch, stream, step, kv)
+            out = {}
+            for oproj in spec.OPROJ_ISSUES:
+                runner.step_begin()
+                key = _split_key(S, kind, oproj)
+                args = _split_args(qkvo, kv, md)
+                so, bo = _k2(runner, w, key, args, s1, step.pad, kind)
+                torch.accelerator.synchronize()
+                tn._assert_healthy(runner)
+                out[oproj] = (so, bo, _xo(runner, S))
+            where = f"{kind} {lens} S={S}: early vs late"
+            (sl, bl, xl), (se, be, xe) = out["late"], out["early"]
+            with tn._tp_checks(where):
+                assert torch.equal(se, sl), "stream_out"
+                assert torch.equal(be, bl), "branch_out"
+                assert torch.equal(xe, xl), "xo"
+            tn._all_ranks_equal(se, f"stream_out ({where})")
+
+
+@ray.remote(num_gpus=1, max_calls=1)
+def _early_vs_late_worker(monkeypatch, tp_size, pp_size, rank, distributed_init_port):
+    _early_vs_late(monkeypatch, tp_size, pp_size, rank, distributed_init_port)
+
+
+@needs_gfx950
+@multi_gpu_test(num_gpus=8)
+def test_split_oproj_early_every_width(monkeypatch: pytest.MonkeyPatch) -> None:
+    multi_process_parallel(monkeypatch, 8, 1, _early_vs_late_worker)
+
+
+# TUNE L3: the split presets the TP8 chain runs (every atom's build at the
+# CASES widths 1, 3, 8; "narrow" = short+wide at 1, 3 and coarse at 8), the
+# default ("coarse") under both o_proj placements, short+wide "early"
+CHAIN_PRESETS = (
+    ("narrow", "late"),
+    ("coarse", "late"),
+    ("coarse", "early"),
+    ("short+wide", "early"),
+)
+
+
+# the preset and o_proj placement ``_chain_preset_worker`` runs: read in each
+# Ray worker (a local Ray cluster's workers inherit the driver's environment
+# as of ``ray.init``), set per parameter by ``test_layer_chain_split_preset``
+PRESET_ENV, PRESET_OPROJ_ENV = "MUSE_SPLIT_PRESET", "MUSE_SPLIT_OPROJ"
+
+
+@ray.remote(num_gpus=1, max_calls=1)
+def _chain_preset_worker(monkeypatch, tp_size, pp_size, rank, distributed_init_port):
+    _chain(
+        "stock",
+        monkeypatch,
+        tp_size,
+        pp_size,
+        rank,
+        distributed_init_port,
+        # no default: a worker that missed the driver's environment must not
+        # silently run the design's build (TUNE L3 review)
+        os.environ[PRESET_OPROJ_ENV],
+        os.environ[PRESET_ENV],
+    )
+
+
+@needs_gfx950
+@multi_gpu_test(num_gpus=8)
+@pytest.mark.parametrize(
+    "preset,oproj", CHAIN_PRESETS, ids=[f"{p}-{o}" for p, o in CHAIN_PRESETS]
+)
+def test_layer_chain_split_preset(
+    preset: str, oproj: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """TUNE L3: ``test_layer_chain_split``'s checks (stock front) on a split
+    preset's build: xo vs vLLM's gated core and fp64 (E9), stream_out vs
+    K2(gated) and the stock span, the tail bit for bit K2(tensor) on its own
+    xo, branch vs vLLM's experts, NaN pad rows inert, ranks equal; an
+    "early" build also bit for bit the preset's "late" build."""
+    monkeypatch.setenv(PRESET_ENV, preset)
+    monkeypatch.setenv(PRESET_OPROJ_ENV, oproj)
+    multi_process_parallel(monkeypatch, 8, 1, _chain_preset_worker)
+
+
+# TUNE L3 at every width (EARLY_CASES): each preset's "late" build vs the
+# design's (the same keys split another way: fp32 rounding only) and its
+# "early" build bit for bit its "late" one
+WIDTH_PRESETS = ("narrow", "coarse")
+
+
+def _presets_every_width(monkeypatch, tp_size, pp_size, rank, distributed_init_port):
+    """At every width and kind, each ``WIDTH_PRESETS`` build: xo within the
+    core targets of the design's split build (cos, and never further from the
+    fp64 gated attention than it by more than 2 ulps), stream_out cos, pad
+    rows zero; its "early" build bit for bit its "late" one; health zero."""
+    device = tn._init_worker(monkeypatch, tp_size, pp_size, rank, distributed_init_port)
+
+    from vllm.models.muse_spark.amd.specialized_decode.runtime.runner import MonoRunner
+
+    runner = MonoRunner(device)
+    runner.set_wait_budget(STARTUP_WAIT_SECONDS)
+    w = tn._weights(rank, device)
+    fw = _front_weights(rank, device)
+    mrv2 = _fake_mrv2(device)
+    for ci, (lens, S) in enumerate(EARLY_CASES):
+        need = sum(-(-L // spec.KV_BLOCK) for L in lens)
+        nblocks = need + 64
+        pages = _pages(lens, nblocks, 300 + ci)
+        step = mrv2.step(list(lens), {FULL: pages, SLIDING: pages}, S)
+        branch, stream = _boundary_inputs(device, S, 90 + ci)
+        pad = step.pad.cpu()
+        live = ~pad
+        lv = live.to(device)
+        for kind in KINDS:
+            g = torch.Generator().manual_seed(3000 * ci + 7 * rank + LAYER[kind])
+            kv = ref.kv_cache(nblocks, device=device, generator=g)
+            md = step.attn_metadata[NAME[kind]]
+            runner.step_begin()
+            s1, qkvo = _front("stock", runner, fw, kind, branch, stream, step, kv)
+            args = _split_args(qkvo, kv, md)
+            runner.step_begin()
+            sb, _ = _k2(runner, w, _split_key(S, kind), args, s1, step.pad, kind)
+            torch.accelerator.synchronize()
+            tn._assert_healthy(runner)
+            xb = _xo(runner, S)
+            q = qkvo[:, :CORE].reshape(S, spec.HEADS, 64)
+            a64 = ref.gqa_decode(
+                q, kv, md.block_table, md.seq_lens, window=kind == SLIDING, pad=pad
+            )
+            g64 = gate64(a64, qkvo[:, spec.ROW_G :].cpu())[live.cpu()]
+            base = xb.cpu().reshape(S, spec.HEADS, 64)[live]
+            e_base = (base.double() - g64).abs().max().item() if live.any() else 0.0
+            for preset in WIDTH_PRESETS:
+                if not spec.split_fields(preset, S, kind == SLIDING):
+                    continue  # the design's build at this width and kind
+                out = {}
+                for oproj in spec.OPROJ_ISSUES:
+                    runner.step_begin()
+                    key = _split_key(S, kind, oproj, preset)
+                    so, bo = _k2(runner, w, key, args, s1, step.pad, kind)
+                    torch.accelerator.synchronize()
+                    tn._assert_healthy(runner)
+                    out[oproj] = (so, bo, _xo(runner, S))
+                where = f"{kind} {lens} S={S} {preset}"
+                (sl, bl, xl), (se, be, xe) = out["late"], out["early"]
+                with tn._tp_checks(where):
+                    assert torch.equal(se, sl), "early vs late: stream_out"
+                    assert torch.equal(be, bl), "early vs late: branch_out"
+                    assert torch.equal(xe, xl), "early vs late: xo"
+                    assert (xl[pad.to(device)].float() == 0).all()
+                    if live.any():
+                        got = xl.cpu().reshape(S, spec.HEADS, 64)[live]
+                        assert ref.cos(got, base) > COS_CORE, ref.cos(got, base)
+                        e_got = (got.double() - g64).abs().max().item()
+                        top = g64.abs().max().item()
+                        ulp = 2.0 ** (math.floor(math.log2(top)) - 7)
+                        assert e_got <= e_base + 2 * ulp, (e_got, e_base)
+                        assert ref.cos(sl[lv], sb[lv]) > tn.COS_STAGE
+                        u = tps.row_ulps(got, base)
+                        print(
+                            f"{where}: xo vs base max {u.max().item():.2f} row "
+                            f"ulps; fp64 err {e_got:.3g} (base {e_base:.3g})",
+                            flush=True,
+                        )
+                tn._all_ranks_equal(sl, f"stream_out ({where})")
+
+
+@ray.remote(num_gpus=1, max_calls=1)
+def _presets_every_width_worker(
+    monkeypatch, tp_size, pp_size, rank, distributed_init_port
+):
+    _presets_every_width(monkeypatch, tp_size, pp_size, rank, distributed_init_port)
+
+
+@needs_gfx950
+@multi_gpu_test(num_gpus=8)
+def test_split_presets_every_width(monkeypatch: pytest.MonkeyPatch) -> None:
+    multi_process_parallel(monkeypatch, 8, 1, _presets_every_width_worker)
+
+
+def _replay(
+    front,
+    monkeypatch,
+    tp_size,
+    pp_size,
+    rank,
+    distributed_init_port,
+    oproj="late",
+    preset="base",
+):
     device = tn._init_worker(monkeypatch, tp_size, pp_size, rank, distributed_init_port)
 
     from vllm.models.muse_spark.amd.specialized_decode.runtime.runner import MonoRunner
@@ -709,10 +1090,31 @@ def _replay(front, monkeypatch, tp_size, pp_size, rank, distributed_init_port):
         """Two kernel layers: the full one, then the sliding one on its
         deferred boundary (one step_begin)."""
         s1, b1, _ = _split_step(
-            front, runner, w, fw, FULL, branch, stream, step, kv[FULL]
+            front,
+            runner,
+            w,
+            fw,
+            FULL,
+            branch,
+            stream,
+            step,
+            kv[FULL],
+            oproj=oproj,
+            preset=preset,
         )
         s2, b2, _ = _split_step(
-            front, runner, w, fw, SLIDING, b1, s1, step, kv[SLIDING], begin=False
+            front,
+            runner,
+            w,
+            fw,
+            SLIDING,
+            b1,
+            s1,
+            step,
+            kv[SLIDING],
+            begin=False,
+            oproj=oproj,
+            preset=preset,
         )
         return [s1, b1, s2, b2]
 
@@ -783,3 +1185,54 @@ def test_graph_replay_follows_metadata(
 ) -> None:
     worker = _replay_k1_worker if front == "k1" else _replay_stock_worker
     multi_process_parallel(monkeypatch, 8, 1, worker)
+
+
+@ray.remote(num_gpus=1, max_calls=1)
+def _replay_early_worker(monkeypatch, tp_size, pp_size, rank, distributed_init_port):
+    _replay(
+        "stock", monkeypatch, tp_size, pp_size, rank, distributed_init_port, "early"
+    )
+
+
+@needs_gfx950
+@multi_gpu_test(num_gpus=8)
+def test_graph_replay_oproj_early(monkeypatch: pytest.MonkeyPatch) -> None:
+    multi_process_parallel(monkeypatch, 8, 1, _replay_early_worker)
+
+
+# TUNE L3 review: the replay graph (S = 2, request 0 crossing the window and a
+# page every 16 steps) on tuned split builds: full N 16, sliding N 17
+# ("early"); MIN_PER 16, sliding N 9 (the default "coarse")
+REPLAY_PRESETS = (("short+wide", "early"), ("coarse", "late"))
+
+
+@ray.remote(num_gpus=1, max_calls=1)
+def _replay_preset_worker(monkeypatch, tp_size, pp_size, rank, distributed_init_port):
+    _replay(
+        "stock",
+        monkeypatch,
+        tp_size,
+        pp_size,
+        rank,
+        distributed_init_port,
+        os.environ[PRESET_OPROJ_ENV],
+        os.environ[PRESET_ENV],
+    )
+
+
+@needs_gfx950
+@multi_gpu_test(num_gpus=8)
+@pytest.mark.parametrize(
+    "preset,oproj", REPLAY_PRESETS, ids=[f"{p}-{o}" for p, o in REPLAY_PRESETS]
+)
+def test_graph_replay_split_preset(
+    preset: str, oproj: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``test_graph_replay_follows_metadata`` (stock front) on a split
+    preset's builds: every replay equals an eager run, health zero."""
+    assert all(
+        spec.split_fields(preset, len(REPLAY_START), w) for w in (False, True)
+    ), preset
+    monkeypatch.setenv(PRESET_ENV, preset)
+    monkeypatch.setenv(PRESET_OPROJ_ENV, oproj)
+    multi_process_parallel(monkeypatch, 8, 1, _replay_preset_worker)
