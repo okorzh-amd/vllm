@@ -7,6 +7,7 @@ from typing import ClassVar
 
 import torch
 
+import vllm.envs as envs
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.config import VllmConfig, get_layers_from_vllm_config
 from vllm.config.cache import CacheDType
@@ -485,6 +486,9 @@ class AiterFlashAttentionMetadataBuilder(
 
         sliding_window_configs: set[tuple[int, int] | None] = set()
         kv_sharing_shape = None
+        # Whether any layer here could read a trimmed verify table (forward
+        # keeps alibi layers on the full table).
+        swa_verify_trim_usable = False
         layers = get_layers_from_vllm_config(self.vllm_config, Attention)
         for name, layer in layers.items():
             if name not in layer_names:
@@ -494,6 +498,12 @@ class AiterFlashAttentionMetadataBuilder(
                 "with Aiter Flash Attention Impl."
             )
             sliding_window_configs.add(layer.impl.sliding_window)
+            if (
+                layer.impl.sliding_window is not None
+                and layer.impl.sliding_window[0] != -1
+                and layer.impl.alibi_slopes is None
+            ):
+                swa_verify_trim_usable = True
             if (
                 layer.kv_sharing_target_layer_name is not None
                 or layer.kv_cache_update_bypass
@@ -512,9 +522,22 @@ class AiterFlashAttentionMetadataBuilder(
         self._swa_block_table: torch.Tensor | None = None
         self._swa_seq_lens: torch.Tensor | None = None
         self._swa_block_offsets: torch.Tensor | None = None
+        # Spec-decode verify (q > 1 decodes) on the trimmed table is opt-in:
+        # AITER's unsplit sliding-window kernel already starts at the window,
+        # so the trim saves kernel work only once AITER splits sliding-window
+        # verify over the KV, and it costs ~9 small launches per builder per
+        # step. Plain decode (q == 1) always trims.
+        self._swa_verify_trim = False
         if self.aot_sliding_window is not None:
             window = self.aot_sliding_window[0] + 1
-            num_window_blocks = cdiv(window, self.block_size) + 1
+            # A decode of q query rows reads the keys of its last W + q - 1
+            # positions; verify (q up to the reorder threshold) needs the
+            # wider table, plain decode (q == 1) keeps the old width.
+            max_decode_q = 1
+            if envs.VLLM_ROCM_AITER_FA_SWA_VERIFY_TRIM and swa_verify_trim_usable:
+                self._swa_verify_trim = True
+                max_decode_q = max(1, self.reorder_batch_threshold or 1)
+            num_window_blocks = cdiv(window + max_decode_q - 1, self.block_size) + 1
             max_num_reqs = vllm_config.scheduler_config.max_num_seqs
             self._swa_block_table = torch.zeros(
                 (max_num_reqs, num_window_blocks), dtype=torch.int32, device=device
@@ -551,11 +574,23 @@ class AiterFlashAttentionMetadataBuilder(
         seq_lens: torch.Tensor,
         num_decodes: int,
         max_seq_len: int,
+        query_start_loc: torch.Tensor | None = None,
+        max_query_len: int = 1,
     ) -> tuple[torch.Tensor | None, torch.Tensor | None, int]:
         """Trim the decode block table to the sliding window.
 
-        Exact: the kernel's window mask drops the leading tokens of the first
-        kept block, and RoPE is already applied in the cache.
+        Request r with seq len L and q query rows: row i sits at position
+        L - q + i and sees keys [L - q + i - (W - 1), L - q + i], so no row
+        reads a key before L - q - (W - 1). Dropping the whole blocks before
+        that key and rebasing the seq len by the same amount is exact: the
+        kernels derive query positions from seqused_k - query_len and mask
+        with key/query differences only, the window mask drops the leading
+        tokens of the first kept block, and RoPE is already in the cache.
+
+        ``query_start_loc`` (device, the decodes' offsets) gives each
+        request's own q when ``max_query_len`` > 1; q == 1 batches skip it.
+        Returns (None, None, 0) when the persistent table is too narrow for
+        ``max_query_len``; the caller then reads the full table.
         """
         if (
             self._swa_block_table is None
@@ -565,19 +600,33 @@ class AiterFlashAttentionMetadataBuilder(
             return None, None, 0
         assert self._swa_seq_lens is not None and self._swa_block_offsets is not None
         window = self.aot_sliding_window[0] + 1
+        num_window_blocks = self._swa_block_table.shape[1]
+        # A kept range spans at most W + q - 1 + (block_size - 1) keys.
+        if cdiv(window + max_query_len - 1, self.block_size) + 1 > num_window_blocks:
+            return None, None, 0
         lens = seq_lens[:num_decodes]
-        first_block = torch.clamp(lens - window, min=0) // self.block_size
-        index = (first_block.to(torch.int64)[:, None] + self._swa_block_offsets).clamp_(
+        # Earliest key any row reads: L - q - (W - 1) (L - W for q == 1).
+        if max_query_len == 1:
+            first_key = lens - window
+        else:
+            assert query_start_loc is not None
+            query_lens = (
+                query_start_loc[1 : num_decodes + 1] - query_start_loc[:num_decodes]
+            )
+            first_key = (lens - query_lens).sub_(window - 1)
+        first_block = first_key.clamp_(min=0) // self.block_size
+        # int64 offsets + int32 blocks promote to the int64 gather index.
+        index = (self._swa_block_offsets + first_block[:, None]).clamp_(
             max=block_table.shape[1] - 1
         )
         swa_block_table = self._swa_block_table[:num_decodes]
         torch.gather(block_table[:num_decodes], 1, index, out=swa_block_table)
         swa_seq_lens = self._swa_seq_lens[:num_decodes]
-        swa_seq_lens.copy_(lens - first_block * self.block_size)
+        torch.sub(lens, first_block, alpha=self.block_size, out=swa_seq_lens)
         return (
             swa_block_table,
             swa_seq_lens,
-            min(max_seq_len, window + self.block_size - 1),
+            min(max_seq_len, window + max_query_len - 1 + self.block_size - 1),
         )
 
     def build_for_cudagraph_capture(
@@ -674,13 +723,19 @@ class AiterFlashAttentionMetadataBuilder(
         if num_decodes > 0:
             decode_max_query_len = query_lens_cpu[:num_decodes].max().item()
             swa_block_table, swa_seq_lens, swa_max_seq_len = None, None, 0
-            if decode_max_query_len == 1:
+            # Verify (q > 1) reads the trimmed table only on the causal
+            # unified_attention path, and only when opted in (see __init__).
+            if decode_max_query_len == 1 or (
+                self._swa_verify_trim and common_attn_metadata.causal is True
+            ):
                 swa_block_table, swa_seq_lens, swa_max_seq_len = (
                     self._build_swa_decode_tables(
                         common_attn_metadata.block_table_tensor,
                         common_attn_metadata.seq_lens,
                         num_decodes,
                         common_attn_metadata.max_seq_len,
+                        query_start_loc=common_attn_metadata.query_start_loc,
+                        max_query_len=decode_max_query_len,
                     )
                 )
             decode_metadata = AiterFlashAttentionDecodeMetadata(
@@ -1474,6 +1529,27 @@ class AiterFlashAttentionImpl(AttentionImpl):
                         unified_attention,
                     )
 
+                    # Spec-decode verify on a sliding layer: read the
+                    # window-trimmed table when the builder made one
+                    # (VLLM_ROCM_AITER_FA_SWA_VERIFY_TRIM), so a split-KV
+                    # grid is carved over ~W + q keys instead of the whole
+                    # context. Exact for any per-request q (see
+                    # _build_swa_decode_tables).
+                    if (
+                        self.sliding_window[0] != -1
+                        and decode_max_query_len > 1
+                        and self.alibi_slopes is None
+                        and decode_md.swa_block_table is not None
+                    ):
+                        assert decode_md.swa_seq_lens is not None
+                        decode_block_table = decode_md.swa_block_table
+                        decode_seq_lens = decode_md.swa_seq_lens
+                        decode_max_seq_len = decode_md.swa_max_seq_len
+                    else:
+                        decode_block_table = attn_metadata.block_table[:num_decodes]
+                        decode_seq_lens = attn_metadata.seq_lens[:num_decodes]
+                        decode_max_seq_len = attn_metadata.max_seq_len
+
                     unified_attention(
                         q=query[:num_decode_tokens],
                         k=key_cache,
@@ -1481,13 +1557,13 @@ class AiterFlashAttentionImpl(AttentionImpl):
                         out=output[:num_decode_tokens],
                         cu_seqlens_q=attn_metadata.query_start_loc[: num_decodes + 1],
                         max_seqlen_q=decode_max_query_len,
-                        seqused_k=attn_metadata.seq_lens[:num_decodes],
-                        max_seqlen_k=attn_metadata.max_seq_len,
+                        seqused_k=decode_seq_lens,
+                        max_seqlen_k=decode_max_seq_len,
                         softmax_scale=self.scale,
                         causal=True,
                         alibi_slopes=self.alibi_slopes,
                         window_size=self.sliding_window,
-                        block_table=attn_metadata.block_table[:num_decodes],
+                        block_table=decode_block_table,
                         softcap=self.logits_soft_cap,
                         q_descale=None,
                         k_descale=k_descale,

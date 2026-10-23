@@ -159,6 +159,7 @@ if TYPE_CHECKING:
     VLLM_ROCM_FP8_PADDING: bool = True
     VLLM_ROCM_MOE_PADDING: bool = True
     VLLM_ROCM_SHUFFLE_KV_CACHE_LAYOUT: bool = False
+    VLLM_ROCM_AITER_FA_SWA_VERIFY_TRIM: bool = False
     VLLM_ENABLE_V1_MULTIPROCESSING: bool = True
     VLLM_LOG_BATCHSIZE_INTERVAL: float = -1
     VLLM_DISABLE_COMPILE_CACHE: bool = False
@@ -1399,6 +1400,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Whether to use the shuffled kv cache layout
     "VLLM_ROCM_SHUFFLE_KV_CACHE_LAYOUT": lambda: (
         os.getenv("VLLM_ROCM_SHUFFLE_KV_CACHE_LAYOUT", "False").lower() in ("true", "1")
+    ),
+    # ROCm AITER FA: give spec-decode verify (q > 1 decodes) on sliding-window
+    # layers the window-trimmed block table too. Off by default: AITER's
+    # unsplit sliding-window kernel already walks only the window, so the
+    # trim only pays once AITER splits sliding-window verify over the KV
+    # (gfx950: _gfx950_split_grid and kv_split["SW"].MAX_SEGMENTS).
+    "VLLM_ROCM_AITER_FA_SWA_VERIFY_TRIM": lambda: (
+        os.getenv("VLLM_ROCM_AITER_FA_SWA_VERIFY_TRIM", "False").lower()
+        in ("true", "1")
     ),
     # Custom quick allreduce kernel for MI3* cards
     # Choice of quantization level: FP, INT8, INT6, INT4, INT3 or NONE
