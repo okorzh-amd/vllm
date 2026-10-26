@@ -137,14 +137,15 @@ def _swa_old_ops(c, b):
     _copy_ragged_to_graph_buffers(ragged, indptr, b["ragged"], b["indptr"], n, width)
 
 
+@pytest.mark.parametrize("num_spec", [5, 6])
 @pytest.mark.parametrize("noncausal", [False, True])
-def test_swa_decode_meta_matches_vllm_ops(noncausal):
+def test_swa_decode_meta_matches_vllm_ops(noncausal, num_spec):
     from vllm.models.deepseek_v41.amd.ops import swa_decode_meta
     from vllm.v1.attention.backends.mla.compressor_utils import (
         get_dspark_swa_index_width,
     )
 
-    width = get_dspark_swa_index_width(WINDOW, 5) if noncausal else WINDOW
+    width = get_dspark_swa_index_width(WINDOW, num_spec) if noncausal else WINDOW
     g = torch.Generator().manual_seed(1234)
     failed, done = [], 0
     while done < 300:
