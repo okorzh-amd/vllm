@@ -31,8 +31,13 @@ that it replaces.
 
 import torch
 
-from vllm.models.deepseek_v41.amd.ops import enabled
+from vllm.logger import init_logger
+from vllm.models.deepseek_v41.amd.ops import c1ab_swameta_enabled, enabled
 from vllm.triton_utils import tl, triton
+
+logger = init_logger(__name__)
+# VLLM_C1AB_SWAMETA engagement variants already logged (noncausal flags).
+_c1ab_logged: set[bool] = set()
 
 # One program holds all rows of the batch in registers, as a ROWS x WIDTH
 # tile of int32. 32 rows of a 128 wide window are 16 values per thread.
@@ -183,7 +188,17 @@ def build(builder, common_prefix_len, cam, fast_build, replay_start, metadata_cl
     draft block, built with one launch, or None when the batch needs the rest
     of DeepseekV41ROCMAiterSparseSWAMetadataBuilder.build."""
     if not enabled():
-        return None
+        # VLLM_C1AB_SWAMETA: the same build on gfx950. Unset, gfx950 returns
+        # here exactly as before.
+        if not c1ab_swameta_enabled():
+            return None
+        # The PCP base build slices slot_mapping to this rank's chunk first;
+        # this launch does not, so leave PCP on vLLM's build.
+        if getattr(builder, "pcp_size", 1) > 1:
+            return None
+        c1ab = True
+    else:
+        c1ab = False
     from vllm.v1.attention.backends.mla import sparse_swa
     from vllm.v1.attention.backends.utils import split_decodes_and_prefills
 
@@ -241,6 +256,16 @@ def build(builder, common_prefix_len, cam, fast_build, replay_start, metadata_cl
         builder.block_size,
         noncausal=noncausal,
     )
+
+    if c1ab and noncausal not in _c1ab_logged:
+        # Guard with a set so the per-step hot path skips info_once's rank
+        # lookup and lru_cache hashing after the first build of each variant.
+        _c1ab_logged.add(noncausal)
+        logger.info_once(
+            "VLLM_C1AB_SWAMETA: gfx950 SWA decode metadata built with one "
+            "launch (swa_decode_meta, %s).",
+            "draft non-causal" if noncausal else "causal",
+        )
 
     # These are the fields DeepseekSparseSWAMetadataBuilder.build returns for
     # a batch without prefill tokens, and the ragged views

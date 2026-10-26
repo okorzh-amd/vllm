@@ -13,6 +13,7 @@ them.
 """
 
 import functools
+import os
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, NamedTuple
@@ -364,6 +365,45 @@ def _remap_compact_topk(
     )
 
 
+# c1 A/B (VLLM_C1AB_NOFILL=1): on a step of only decode rows, skip the -1
+# fill of the rows the decode top-k writes in full. Unset: the fill runs as
+# before.
+_C1AB_NOFILL = os.environ.get("VLLM_C1AB_NOFILL", "0") == "1"
+
+
+def _fill_topk_buffer(
+    buffer: torch.Tensor, num_tokens: int, metadata, topk_tokens: int
+) -> None:
+    """``buffer[:num_tokens] = -1``, minus the rows a decode-only step's
+    top-k overwrites anyway (VLLM_C1AB_NOFILL).
+
+    On such a step (no prefill chunk) the top-k runs once over the decode
+    rows [0, rows), rows = ``decode_row_lens.shape[0]``, and writes every one
+    of the topk_tokens entries of each row: vLLM's top_k_per_row_decode
+    (topKPerRowJob, csrc/sampler.cu) stores all topK slots, the -1 past a
+    short row's end included, and `_remap_compact_topk` rewrites every slot
+    and keeps -1. So the fill is dead on those rows whatever reads them.
+    Only vLLM's kernel is relied on: `_topk` picks it for every width when
+    rows < 128 and k < 2048. Rows past ``rows`` (none in a uniform FULL
+    graph) still get the fill, as do mixed and prefill steps."""
+    rows = 0
+    if (
+        _C1AB_NOFILL
+        and metadata.prefill is None
+        and metadata.decode is not None
+        and metadata.decode_row_lens is not None
+        and buffer.shape[1] == topk_tokens
+        and topk_tokens < 2048
+    ):
+        rows = metadata.decode_row_lens.shape[0]
+        if rows >= 128:
+            rows = 0
+    if rows == 0:
+        buffer[:num_tokens] = -1
+    elif rows < num_tokens:
+        buffer[rows:num_tokens] = -1
+
+
 @dataclass
 class _Layer:
     """One indexer layer's inputs and outputs for this step."""
@@ -679,7 +719,12 @@ def rocm_mxfp4_sparse_attn_indexer(
         candidate_block_size,
     )
     metadata = layer.metadata
-    topk_indices_buffer[: hidden_states.shape[0]] = -1
+    if _C1AB_NOFILL:
+        _fill_topk_buffer(
+            topk_indices_buffer, hidden_states.shape[0], metadata, topk_tokens
+        )
+    else:
+        topk_indices_buffer[: hidden_states.shape[0]] = -1
     if metadata.prefill is not None:
         for chunk, plan in zip(metadata.prefill.chunks, metadata.prefill_plans):
             _dense_prefill(layer, chunk, plan, candidate_write)
@@ -729,7 +774,12 @@ def rocm_mxfp4_sparse_mqa_indexer(
         candidate_block_size,
     )
     metadata = layer.metadata
-    topk_indices_buffer[: hidden_states.shape[0]] = -1
+    if _C1AB_NOFILL:
+        _fill_topk_buffer(
+            topk_indices_buffer, hidden_states.shape[0], metadata, topk_tokens
+        )
+    else:
+        topk_indices_buffer[: hidden_states.shape[0]] = -1
     if metadata.prefill is not None:
         for chunk, plan in zip(metadata.prefill.chunks, metadata.prefill_plans):
             if not plan.use_gather:

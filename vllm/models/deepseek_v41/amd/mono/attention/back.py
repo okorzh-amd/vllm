@@ -565,7 +565,12 @@ def stage_combine(c, unit):
     h = hg * COMB_HEADS + wave
     nchunk = c["nchunk"]
     ck = chunk_keys(d, s)
-    kv_len = ld_i32(a["klen"], t)
+    if const_expr("klenfix" in c):
+        # VLLM_C1AB_KLENFIX (set with "krdy"): a key table this launch builds:
+        # its count once published, past the CU's cache (a CTA without split
+        # work gets here first)
+        await_flags(c, c["krdy"], 1, lambda u: t)
+    kv_len = ld_i32(a["klen"], t, CM_DEV if const_expr("klenfix" in c) else 0)
     nlive = (kv_len + ck - 1) // ck
     pos = ld_i32(a["pos"], 2 * t)
     sink = ld_f32(a["sink"], h) * fx.Float32(LOG2E)

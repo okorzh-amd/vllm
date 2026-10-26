@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 import typing
 from collections.abc import Callable, Iterable
 from itertools import islice
@@ -76,6 +77,10 @@ from ..common.engram import (
     gather_engram_hashes,
 )
 from ..common.mm_preprocess import IMAGE_SENTINEL_BASE_ID, image_sentinel_mask
+
+# c1 A/B (VLLM_C1AB_DEADLAUNCH=1): drop launches whose results nobody reads or
+# that fold into a neighbour bit-exactly. Unset: the launches run as before.
+_C1AB_DEADLAUNCH = os.environ.get("VLLM_C1AB_DEADLAUNCH", "0") == "1"
 
 if typing.TYPE_CHECKING:
     from vllm.v1.attention.backends.mla.sparse_swa import DeepseekSparseSWAMetadata
@@ -654,6 +659,17 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             )
         else:
             self._mtp_hidden_buffer = None
+        # DFlash/DSpark read the target's hidden states only when it returns
+        # no aux hidden states (DFlashSpeculator._store_hidden_states); with
+        # them the [T, hc_dim] copy below is a dead store (V2 runner only,
+        # the V1 runner's proposer path is not covered by that argument).
+        self._c1ab_skip_mtp_copy = (
+            _C1AB_DEADLAUNCH
+            and self._mtp_hidden_buffer is not None
+            and spec_config is not None
+            and spec_config.method in ("dflash", "dspark")
+            and vllm_config.use_v2_model_runner
+        )
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
@@ -728,8 +744,13 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 # Image-span tokens are dead: they break n-grams (hash op
                 # takes True=dead) and their gate is zeroed (Engram.forward
                 # takes True=keep).
-                image_mask = image_sentinel_mask(input_ids)
-                engram_mask = ~image_mask
+                if _C1AB_DEADLAUNCH:
+                    # one launch for the keep mask; the hash kernels compare
+                    # the ids with the sentinel themselves (dead_token_id)
+                    engram_mask = input_ids != IMAGE_SENTINEL_BASE_ID
+                else:
+                    image_mask = image_sentinel_mask(input_ids)
+                    engram_mask = ~image_mask
                 if lookback_token_ids is None:
                     if not self.engram_hash.use_slot_cache:
                         raise NotImplementedError(
@@ -740,16 +761,29 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                     lookback_token_ids = input_ids.new_full(
                         (num_reqs, self.engram_hash.lookback_depth), -1
                     )
-                engram_hashes = self.engram_hash(
-                    input_ids,
-                    positions,
-                    swa_metadata.query_start_loc,
-                    image_mask,
-                    lookback_token_ids,
-                    image_sentinel_mask(lookback_token_ids),
-                    swa_metadata.slot_mapping,
-                    swa_metadata.block_table,
-                )
+                if _C1AB_DEADLAUNCH:
+                    engram_hashes = self.engram_hash(
+                        input_ids,
+                        positions,
+                        swa_metadata.query_start_loc,
+                        None,
+                        lookback_token_ids,
+                        None,
+                        swa_metadata.slot_mapping,
+                        swa_metadata.block_table,
+                        dead_token_id=IMAGE_SENTINEL_BASE_ID,
+                    )
+                else:
+                    engram_hashes = self.engram_hash(
+                        input_ids,
+                        positions,
+                        swa_metadata.query_start_loc,
+                        image_mask,
+                        lookback_token_ids,
+                        image_sentinel_mask(lookback_token_ids),
+                        swa_metadata.slot_mapping,
+                        swa_metadata.block_table,
+                    )
             elif not self.engram_dp_shared_memory and get_engram_dp_size() > 1:
                 # DP-sharded lookups are collective, so a replica skipping the
                 # hash still has to reach them.
@@ -840,7 +874,9 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             hidden_states = sp_all_gather(hidden_states)[:full_num_tokens]
             pre_mix = sp_all_gather(pre_mix)[:full_num_tokens]
 
-        if self._mtp_hidden_buffer is not None:
+        if self._mtp_hidden_buffer is not None and not (
+            self._c1ab_skip_mtp_copy and len(aux_hidden_states) > 0
+        ):
             num_tokens = hidden_states.shape[0]
             self._mtp_hidden_buffer[:num_tokens].copy_(hidden_states.flatten(1))
 

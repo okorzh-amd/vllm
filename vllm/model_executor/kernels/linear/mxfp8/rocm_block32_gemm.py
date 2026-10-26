@@ -46,6 +46,8 @@ The packed kernel and the in-launch split-K reduction on one XCD
 adapted from the group32 GEMM in ROCm/aiter#5750.
 """
 
+import functools
+import os
 from typing import NamedTuple
 
 import torch
@@ -542,6 +544,29 @@ _TUNED: dict[tuple[int, int], list[tuple[int, _Config]]] = {
 }
 
 
+# VLLM_C1AB_ENGRAM_TUNE=1 (A/B gate, off by default): small-M tiers for the
+# Engram wkv projection at TP4 (MergedColumnParallel, 5 x 5120 / 4 = 6400
+# rows, K = 3 x 8 x 256 = 6144), which has no _TUNED entry and otherwise takes
+# _default_config's one-split packed tile (400 programs of 2 warps). NOT tuned
+# on this shape: the tiers are copied from the nearest tuned large-N, large-K
+# shape, wo_b TP2 (5120, 4096), whose small-M tiers split K in the launch
+# (800 programs at M 7..32 instead of 400 or 200). Its M <= 32 tier (32 x 64
+# x 512, 8 warps) spills 187 VGPRs at this K on gfx950, so M 17..32 keep its
+# M <= 24 tier. Larger M keeps _default_config.
+_C1AB_ENGRAM_TUNED: dict[tuple[int, int], list[tuple[int, _Config]]] = {
+    (6400, 6144): [
+        (8, _packed(8, 16, 128, 4, 2, 2, 16, 0, 2)),
+        (16, _tiled(16, 32, 256, 1, True, 2, 2, 16, 0, 4)),
+        (32, _tiled(32, 32, 256, 1, True, 4, 3, 16, 0, 4)),
+    ],
+}
+
+
+@functools.cache
+def _c1ab_engram_tune() -> bool:
+    return os.environ.get("VLLM_C1AB_ENGRAM_TUNE", "0") == "1"
+
+
 def _default_config(M: int, N: int, K: int) -> _Config:
     """Untuned shapes: the tiers most tuned shapes settle on."""
     if M <= 8:
@@ -556,6 +581,10 @@ def _default_config(M: int, N: int, K: int) -> _Config:
 def _config(M: int, N: int, K: int) -> _Config:
     tiers = _TUNED.get((N, K))
     if tiers is None:
+        if _c1ab_engram_tune():
+            for max_m, cfg in _C1AB_ENGRAM_TUNED.get((N, K), ()):
+                if max_m >= M:
+                    return cfg
         return _default_config(M, N, K)
     for max_m, cfg in tiers:
         if max_m >= M:

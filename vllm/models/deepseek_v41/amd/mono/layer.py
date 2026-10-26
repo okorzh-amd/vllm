@@ -14,6 +14,7 @@ Peer regions alternate by e's parity; every rank runs the same launches, so
 the epochs agree across ranks.
 """
 
+import os
 from dataclasses import dataclass
 
 import flydsl.compiler as flyc
@@ -164,6 +165,13 @@ def _symbol_params(key: MonoBuild) -> dict:
 
 def _back_key(key: MonoBuild):
     return mb_back.BackBuild(key.tokens, key.tp, key.ratio, key.timeline, key.tuned)
+
+
+def _c1ab_klenfix(key: MonoBuild) -> bool:
+    """VLLM_C1AB_KLENFIX=1: an index build's K2 combine waits on the key table
+    this launch builds (``krdy``) before it reads klen (vllm#61482's V4-Pro
+    fix). Read when K2 is built; off, K2 compiles as before."""
+    return key.index and os.environ.get("VLLM_C1AB_KLENFIX", "0") == "1"
 
 
 def scratch_layout(
@@ -858,6 +866,7 @@ def build_mono_k2(key: MonoBuild):
         seam: SeamLds  # type: ignore[valid-type]
         moe: MoeLds  # type: ignore[valid-type]
 
+    klenfix = _c1ab_klenfix(key)
     name = kernel_symbol(
         "dsv41_mono_k2",
         s=s,
@@ -866,8 +875,12 @@ def build_mono_k2(key: MonoBuild):
         tl=key.timeline,
         i=key.index,
         **_symbol_params(key),
+        **({"kf": True} if klenfix else {}),
     )
     keyed = key_tuple(key, SOURCES)
+    if klenfix:
+        # the flag reaches the JIT cache key: a flip never reuses a stale K2
+        keyed = (*keyed, ("klenfix", True))
 
     @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
     def k2(
@@ -1013,6 +1026,8 @@ def build_mono_k2(key: MonoBuild):
                 },
             }
             c["krdy"] = sreg(scratch, layout["krdy"][0], "krdy")
+            if const_expr(klenfix):
+                c["klenfix"] = True
             for t in range(first_task(bid, BLOCKS - s, key.tuned), s, BLOCKS):
                 mb_front.stage_kt(ckt, t)
                 mb_back.publish(c, c["krdy"], t)

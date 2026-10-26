@@ -2,6 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 
+import math
+import os
+
 import torch
 from torch.distributed import ProcessGroup
 
@@ -33,6 +36,12 @@ NCCL_DIRECT_SYMM_RS_OUTPUT_MIN_VERSION = 22902
 
 
 class CudaCommunicator(DeviceCommunicatorBase):
+    # VLLM_C1AB_AITER_AG state; class defaults keep the flag off for
+    # instances built without __init__ (tests use CudaCommunicator.__new__).
+    _c1ab_aiter_ag: bool = False
+    _c1ab_aiter_ag_reg: bool = False
+    _c1ab_aiter_ag_max_bytes: int = 0
+
     def __init__(
         self,
         cpu_group: ProcessGroup,
@@ -195,6 +204,35 @@ class CudaCommunicator(DeviceCommunicatorBase):
             # On ROCm, 'use_custom_allreduce==True' means it must currently be
             # an MI300 series.
             self.qr_comm = QuickAllReduce(group=self.cpu_group, device=self.device)
+
+        # C1AB experiment: route small TP all-gathers to the AITER custom
+        # all-gather (see _c1ab_aiter_all_gather). Off unless
+        # VLLM_C1AB_AITER_AG=1; read once here so a traced/compiled forward
+        # never re-reads the environment.
+        if (
+            current_platform.is_rocm()
+            and os.environ.get("VLLM_C1AB_AITER_AG", "0") == "1"
+            and self.use_aiter_allreduce
+            and self.aiter_ar_comm is not None
+            and not self.aiter_ar_comm.disabled
+            and self.world_size in (2, 4, 8)
+        ):
+            self._c1ab_aiter_ag = True
+            self._c1ab_aiter_ag_reg = (
+                os.environ.get("VLLM_C1AB_AITER_AG_REG", "0") == "1"
+            )
+            self._c1ab_aiter_ag_max_bytes = int(
+                os.environ.get("VLLM_C1AB_AITER_AG_MAX_BYTES", str(2 * 1024 * 1024))
+            )
+            logger.info_once(
+                "VLLM_C1AB_AITER_AG=1: TP all_gather (dim 0, or any dim of a "
+                "contiguous fp32/fp16/bf16 input) up to %d bytes per rank uses "
+                "the AITER custom all-gather (%s capture path) for group '%s'.",
+                self._c1ab_aiter_ag_max_bytes,
+                "registered" if self._c1ab_aiter_ag_reg else "copy-in",
+                self.unique_name,
+                scope="local",
+            )
 
         if self.world_size > 1:
             self._log_all_reduce_backend_selection()
@@ -477,6 +515,10 @@ class CudaCommunicator(DeviceCommunicatorBase):
         # copy on every step. This is on the hot path for TP forward passes, so
         # keep ROCm on the base-class collective to avoid a decode regression.
         if current_platform.is_rocm():
+            if self._c1ab_aiter_ag:
+                out = self._c1ab_aiter_all_gather(input_, dim)
+                if out is not None:
+                    return out
             return super().all_gather(input_, dim)
 
         input_size = input_.size()
@@ -492,6 +534,90 @@ class CudaCommunicator(DeviceCommunicatorBase):
             + (self.world_size * input_size[dim],)
             + input_size[dim + 1 :]
         )
+
+    def _c1ab_aiter_all_gather(
+        self, input_: torch.Tensor, dim: int
+    ) -> torch.Tensor | None:
+        """VLLM_C1AB_AITER_AG: one AITER IPC all-gather kernel instead of RCCL
+        ``all_gather_into_tensor`` (+ the movedim copy when ``dim != 0``).
+
+        AITER gathers only dim 0 or the last dim, so a contiguous input
+        gathered on dim ``d > 0`` is viewed as ``[prod(shape[:d]),
+        prod(shape[d:])]`` and gathered on its last dim: rank r's row ``a``
+        lands at columns ``[r * K, (r + 1) * K)``, which is exactly the
+        layout of a dim-``d`` concat. The gather is a byte copy, so the
+        result is bit-identical to RCCL.
+
+        The decision reads only dtype, shape and contiguity, which are the
+        same on every TP rank, so ranks never split between RCCL and AITER.
+        Returns None to fall back to RCCL.
+        """
+        if input_.dtype not in (torch.bfloat16, torch.float16, torch.float32):
+            return None
+        numel = input_.numel()
+        if numel == 0 or not input_.is_contiguous():
+            return None
+        elem = input_.element_size()
+        if numel * elem > self._c1ab_aiter_ag_max_bytes:
+            return None
+        comm = self.aiter_ar_comm
+        if comm is None or comm.disabled or not comm.should_custom_ag(input_):
+            return None
+        shape = tuple(input_.shape)
+        if dim == 0:
+            src, kernel_dim = input_, 0
+        else:
+            inner = math.prod(shape[dim:])
+            # allgather_lastdim moves 16-byte packs and floors the row length
+            # to whole packs, so a row must be a whole number of packs.
+            if (inner * elem) % 16 != 0:
+                return None
+            src, kernel_dim = input_.view(numel // inner, inner), 1
+        impl = comm.aiter_ca
+        if self._c1ab_aiter_ag_reg:
+            out = self._c1ab_aiter_ag_registered(impl, src, kernel_dim)
+        else:
+            # Copy-in path in every mode (eager, warmup, graph capture): the
+            # input is staged into AITER's pre-registered pool buffer, so no
+            # graph buffer is added to the capture-time registration set.
+            out = impl.all_gather_unreg(src, dim=kernel_dim)
+        out_shape = shape[:dim] + (self.world_size * shape[dim],) + shape[dim + 1 :]
+        logger.info_once(
+            "VLLM_C1AB_AITER_AG: AITER all-gather took a %s %dD dim=%d gather "
+            "(capturing=%s).",
+            input_.dtype,
+            len(shape),
+            dim,
+            torch.cuda.is_current_stream_capturing(),
+            scope="local",
+        )
+        return out.view(out_shape)
+
+    @staticmethod
+    def _c1ab_aiter_ag_registered(
+        impl, src: torch.Tensor, kernel_dim: int
+    ) -> torch.Tensor:
+        """VLLM_C1AB_AITER_AG_REG=1: AITER's own ``custom_all_gather``, which
+        binds the input directly during capture when every rank agreed on the
+        registered path. AITER raises if such an input cannot be
+        IPC-exported (e.g. a persistent buffer allocated while
+        expandable_segments were on); stage those through the pool instead.
+        """
+        if (
+            getattr(impl, "_IS_CAPTURING", False)
+            and torch.cuda.is_current_stream_capturing()
+            and getattr(impl, "enable_register_for_capturing", False)
+        ):
+            from aiter.dist.device_communicators import (
+                custom_all_reduce as _aiter_car,
+            )
+
+            exportable = getattr(_aiter_car, "_ipc_exportable", None)
+            if exportable is not None and not exportable(src.data_ptr()):
+                return impl.all_gather_unreg(src, dim=kernel_dim)
+        out = impl.custom_all_gather(src, dim=kernel_dim)
+        assert out is not None
+        return out
 
     def reduce_scatter(self, input_: torch.Tensor, dim: int = -1):
         world_size = self.world_size

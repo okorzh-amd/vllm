@@ -279,6 +279,8 @@ def _write_hash_cache_kernel(
     slot_stride,
     BLOCK_SIZE: tl.constexpr,
     dead_id,
+    DEAD_FROM_IDS: tl.constexpr = False,
+    DEAD_TOKEN: tl.constexpr = -1,
 ):
     token_idx = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     slot = tl.load(
@@ -287,7 +289,11 @@ def _write_hash_cache_kernel(
     valid = (token_idx < num_tokens) & (slot >= 0)
     token = tl.load(input_ids + token_idx * input_stride, valid, other=0)
     value = tl.load(token_map + token, valid, other=0)
-    dead = tl.load(dead_mask + token_idx * mask_stride, valid, other=False)
+    if DEAD_FROM_IDS:
+        # dead_mask[i] == (input_ids[i] == DEAD_TOKEN), without its launch
+        dead = valid & (token == DEAD_TOKEN)
+    else:
+        dead = tl.load(dead_mask + token_idx * mask_stride, valid, other=False)
     value = tl.where(dead, dead_id, value)
     tl.store(cache + slot, value, valid)
 
@@ -339,6 +345,8 @@ def _hash_ids_kernel(
     lookback_col_stride,
     lookback_mask_row_stride,
     lookback_mask_col_stride,
+    DEAD_FROM_IDS: tl.constexpr = False,
+    DEAD_TOKEN: tl.constexpr = -1,
 ):
     token = tl.program_id(0) * BLOCK_T + tl.arange(0, BLOCK_T)
     layer = tl.program_id(1)
@@ -374,9 +382,13 @@ def _hash_ids_kernel(
             input_ids + batch_idx * input_stride, valid & in_batch, other=0
         )
         batch_source = tl.load(token_map + batch_token, valid & in_batch, other=0)
-        batch_dead = tl.load(
-            dead_mask + batch_idx * mask_stride, valid & in_batch, other=False
-        )
+        if DEAD_FROM_IDS:
+            # the same element of input_ids the mask was computed from
+            batch_dead = valid & in_batch & (batch_token == DEAD_TOKEN)
+        else:
+            batch_dead = tl.load(
+                dead_mask + batch_idx * mask_stride, valid & in_batch, other=False
+            )
         batch_source = tl.where(batch_dead, dead_id, batch_source)
 
         col = chunk_start - 1 - lookback
@@ -389,13 +401,16 @@ def _hash_ids_kernel(
         )
         known = in_window & (window_token >= 0)
         window_source = tl.load(token_map + window_token, known, other=0)
-        window_dead = tl.load(
-            lookback_dead_mask
-            + req * lookback_mask_row_stride
-            + col * lookback_mask_col_stride,
-            known,
-            other=False,
-        )
+        if DEAD_FROM_IDS:
+            window_dead = known & (window_token == DEAD_TOKEN)
+        else:
+            window_dead = tl.load(
+                lookback_dead_mask
+                + req * lookback_mask_row_stride
+                + col * lookback_mask_col_stride,
+                known,
+                other=False,
+            )
         window_source = tl.where(window_dead, dead_id, window_source)
 
         if cache is not None:
@@ -539,17 +554,30 @@ class NgramHashState(nn.Module):
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         query_start_loc: torch.Tensor,
-        dead_mask: torch.Tensor,
+        dead_mask: torch.Tensor | None,
         lookback_token_ids: torch.Tensor,
-        lookback_dead_mask: torch.Tensor,
+        lookback_dead_mask: torch.Tensor | None,
         slot_mapping: torch.Tensor | None,
         block_table: torch.Tensor | None,
+        dead_token_id: int | None = None,
     ) -> torch.Tensor:
         """Compute [tokens, layers, hash columns] int32 n-gram hashes.
 
         History comes from the current chunk, then the runner's lookback
         window, then the optional V1 slot cache. V2 needs only one launch.
+
+        With ``dead_token_id`` the kernels mark a token dead where its id
+        equals it, in place of ``dead_mask`` / ``lookback_dead_mask`` (which
+        are then unused and may be None): the masks ``ids == dead_token_id``
+        without their launches (VLLM_C1AB_DEADLAUNCH).
         """
+        dead_kw: dict = {}
+        if dead_token_id is not None:
+            dead_kw = dict(DEAD_FROM_IDS=True, DEAD_TOKEN=int(dead_token_id))
+            # never read: only pointer / stride placeholders
+            dead_mask = input_ids
+            lookback_dead_mask = lookback_token_ids
+        assert dead_mask is not None and lookback_dead_mask is not None
         cache = self._cache if self.use_slot_cache else None
         num_tokens = input_ids.shape[0]
         num_layers, max_ngram = self.multipliers.shape
@@ -575,6 +603,7 @@ class NgramHashState(nn.Module):
                 slot_mapping.stride(0),
                 256,
                 DEAD_ID,
+                **dead_kw,
             )
         _hash_ids_kernel[(triton.cdiv(num_tokens, 32), num_layers)](
             input_ids,
@@ -614,6 +643,7 @@ class NgramHashState(nn.Module):
             lookback_mask_row_stride=lookback_dead_mask.stride(0),
             lookback_mask_col_stride=lookback_dead_mask.stride(1),
             num_warps=4,
+            **dead_kw,
         )
         return output
 

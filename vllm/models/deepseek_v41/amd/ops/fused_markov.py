@@ -29,12 +29,27 @@ It runs on gfx942 with --monokernel (``ops.enabled()``). The speculator asks
 the draft model's ``sample_sequential`` (dspark.py) before its loop, and that
 calls ``sample_sequential`` here.
 tests/kernels/models/amd/test_dsv41_gfx942_fused_markov.py compares it with vLLM's loop.
+
+VLLM_C1AB_MARKOV950=1 also runs it on gfx950 with --monokernel (A/B gate;
+off by default, when gfx950 keeps vLLM's loop and the #63181 fused GEMV and
+sample epilogue). The speculator asks this hook before its loop, so when the
+gate is on the fused launches take precedence over #63181 for steps of at
+most MAX_ROWS requests, and larger steps still take the #63181 path.
+VLLM_C1AB_MARKOV950_BLOCK and VLLM_C1AB_MARKOV950_WARPS set the gfx950
+launch's BLOCK (a power of two, 64..1024, default 256) and warps (default
+8); both are Triton constexpr/launch options, so each value builds its own
+kernel.
 """
+
+import functools
+import os
 
 import torch
 
+import vllm.models.deepseek_v41.amd.ops as _ops
 from vllm.logger import init_logger
 from vllm.models.deepseek_v41.amd.ops import enabled
+from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.v1.worker.gpu.sample.gumbel import gumbel_noised_argmax, spec_step_seed
 
@@ -50,6 +65,42 @@ NUM_WARPS = 4
 # The step launch unrolls its loop over the rows (requests) of a step, so it
 # is built for at most this many. A larger step takes vLLM's loop.
 MAX_ROWS = 8
+# The gfx950 launch (VLLM_C1AB_MARKOV950) keeps BLOCK, so the same 505
+# programs and Gumbel blocks, but uses 8 warps: at 4 warps the step kernel
+# needs 266-342 VGPRs on gfx950 (one wave a SIMD), at 8 warps 115-148, with
+# no scratch spills in either (Triton compile for gfx950, ROWS 1..4).
+GFX950_NUM_WARPS = 8
+
+
+@functools.cache
+def _c1ab_gfx950() -> tuple[int, int] | None:
+    """(BLOCK, NUM_WARPS) of the gfx950 launch when VLLM_C1AB_MARKOV950=1
+    on a gfx950 GPU, else None. --monokernel is checked by the caller."""
+    if os.environ.get("VLLM_C1AB_MARKOV950", "0") != "1":
+        return None
+    if not current_platform.is_rocm():
+        return None
+    from vllm.platforms.rocm import on_gfx950
+
+    if not on_gfx950():
+        return None
+    block = int(os.environ.get("VLLM_C1AB_MARKOV950_BLOCK", str(BLOCK)))
+    warps = int(os.environ.get("VLLM_C1AB_MARKOV950_WARPS", str(GFX950_NUM_WARPS)))
+    if block < 64 or block > 1024 or block & (block - 1):
+        raise ValueError(f"VLLM_C1AB_MARKOV950_BLOCK={block}: a power of 2, 64..1024")
+    if warps not in (1, 2, 4, 8, 16):
+        raise ValueError(f"VLLM_C1AB_MARKOV950_WARPS={warps}: 1, 2, 4, 8 or 16")
+    return block, warps
+
+
+def _launch_config() -> tuple[int, int] | None:
+    """(BLOCK, NUM_WARPS) when the fused launches run in this process, None
+    when every step takes vLLM's loop."""
+    if enabled():
+        return BLOCK, NUM_WARPS
+    if _ops._monokernel:
+        return _c1ab_gfx950()
+    return None
 
 
 @triton.jit
@@ -182,13 +233,13 @@ def _markov_last_kernel(
 _buffers: dict = {}
 
 
-def _scratch(device, vocab, use_fp64):
+def _scratch(device, vocab, use_fp64, block=BLOCK):
     """Two sets of block maxima and their token ids, one written by the
     current step and one read from the previous step. They are allocated
     once, so a CUDA graph keeps their addresses."""
-    key = (device, vocab, use_fp64, BLOCK)
+    key = (device, vocab, use_fp64, block)
     if key not in _buffers:
-        nb = triton.cdiv(vocab, BLOCK)
+        nb = triton.cdiv(vocab, block)
         dt = torch.float64 if use_fp64 else torch.float32
         _buffers[key] = [
             (
@@ -235,8 +286,10 @@ def _why_not(spec, num_reqs: int) -> str | None:
 def sample_sequential(spec, num_reqs: int, head_hidden: torch.Tensor) -> bool:
     """DSparkSpeculator._sample_sequential with the fused launches. Returns
     False, having done nothing, when this step takes vLLM's loop."""
-    if not enabled():
+    launch = _launch_config()
+    if launch is None:
         return False
+    block, num_warps = launch
     why = _why_not(spec, num_reqs)
     if why is not None:
         logger.debug_once("DSpark fused Markov sampling off for a step: %s", why)
@@ -263,13 +316,19 @@ def sample_sequential(spec, num_reqs: int, head_hidden: torch.Tensor) -> bool:
     cache = spec.draft_logits
     tokens = spec.draft_tokens
     use_fp64 = bool(spec.use_fp64_gumbel)
-    bufs = _scratch(base_logits.device, vocab, use_fp64)
-    nb = triton.cdiv(vocab, BLOCK)
+    bufs = _scratch(base_logits.device, vocab, use_fp64, block)
+    nb = triton.cdiv(vocab, block)
     nb2 = triton.next_power_of_2(nb)
     logger.info_once(
         "DSpark fused Markov sampling: %d steps, vocabulary %d, rank %d, %d blocks",
         n_spec, vocab, rank, nb,
     )  # fmt: skip
+    if not enabled():
+        logger.info_once(
+            "DSpark fused Markov sampling on gfx950 (VLLM_C1AB_MARKOV950): "
+            "BLOCK %d, %d warps, up to %d requests a step",
+            block, num_warps, MAX_ROWS,
+        )  # fmt: skip
     for step in range(n_spec):
         prev_max, prev_arg = bufs[(step + 1) % 2]
         out_max, out_arg = bufs[step % 2]
@@ -300,11 +359,11 @@ def sample_sequential(spec, num_reqs: int, head_hidden: torch.Tensor) -> bool:
             STEP=step,
             ROWS=num_reqs,
             RANK=rank,
-            BLOCK=BLOCK,
+            BLOCK=block,
             K_CHUNK=K_CHUNK,
             BLOCKS_POW2=nb2,
             USE_FP64=use_fp64,
-            num_warps=NUM_WARPS,
+            num_warps=num_warps,
         )
     last_max, last_arg = bufs[(n_spec - 1) % 2]
     _markov_last_kernel[(num_reqs,)](

@@ -18,6 +18,7 @@ instead of embedding feature-specific logic directly.
 
 import functools
 import gc
+import os
 import time
 from collections.abc import Iterable
 from contextlib import AbstractContextManager
@@ -194,6 +195,11 @@ from vllm.v1.worker.utils import (
 from vllm.v1.worker.workspace import lock_workspace, use_workspace_lane
 
 logger = init_logger(__name__)
+
+# c1 A/B (VLLM_C1AB_DEADLAUNCH=1): skip the identity logits gather and the
+# draft-token gather whose result only matters with structured outputs.
+# Unset: both run as before.
+_C1AB_DEADLAUNCH = os.environ.get("VLLM_C1AB_DEADLAUNCH", "0") == "1"
 
 
 class GPUModelRunner(LoRAModelRunnerMixin):
@@ -1633,6 +1639,29 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             local_logits = self.model.compute_logits_local(sample_hidden_states)
             logits = all_to_all_logits(local_logits, shard_metadata)
             logits = logits[:, : self.vocab_size]
+        elif (
+            _C1AB_DEADLAUNCH
+            and self.pcp_manager is None
+            and self.adaptive_verification is None
+            and input_batch.fast_prefill is None
+            and input_batch.logits_indices.shape[0] == input_batch.num_tokens
+            and hidden_states.is_contiguous()
+        ):
+            # Request i's logits are the last num_logits_i <= query_len_i rows
+            # of its query (combine_sampled_and_draft_tokens), so when they
+            # add up to num_tokens every request takes all its rows and
+            # logits_indices is arange(num_tokens): take the rows as a view.
+            sample_hidden_states = hidden_states[: input_batch.num_tokens]
+            logits = self.model.compute_logits(sample_hidden_states)
+            if (
+                logits is not None
+                and logits.untyped_storage().data_ptr()
+                == hidden_states.untyped_storage().data_ptr()
+            ):
+                # compute_logits handed back its input (logits_as_input):
+                # the sampler edits logits in place, so give it a copy as
+                # the gather did, not a view of the model's output.
+                logits = logits.clone()
         else:
             sample_hidden_states = hidden_states[input_batch.logits_indices]
             logits = self.model.compute_logits(sample_hidden_states)
@@ -2304,10 +2333,19 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if self.num_speculative_steps > 0:
             # Spec-decode and diffusion LLMs both use draft tokens but the latter does
             # not have a speculator (i.e. self.speculator is None)
-            self.draft_tokens_handler.set_draft_tokens(
-                input_batch,
-                self.req_states.draft_tokens[input_batch.idx_mapping, :num_spec_tokens],
-            )
+            if _C1AB_DEADLAUNCH and not input_batch.has_structured_output_reqs:
+                # set_draft_tokens reads only the width of the gather then.
+                self.draft_tokens_handler.set_num_draft_tokens(
+                    input_batch,
+                    len(range(self.req_states.draft_tokens.shape[1])[:num_spec_tokens]),
+                )
+            else:
+                self.draft_tokens_handler.set_draft_tokens(
+                    input_batch,
+                    self.req_states.draft_tokens[
+                        input_batch.idx_mapping, :num_spec_tokens
+                    ],
+                )
             if self.pp_handler is not None:
                 self.pp_handler.broadcast_drafts(
                     self.req_states.draft_tokens, input_batch

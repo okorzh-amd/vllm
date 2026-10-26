@@ -79,6 +79,17 @@ class DraftTokensHandler:
             draft_tokens.record_stream(self.copy_stream)
             self.copy_event.record()
 
+    def set_num_draft_tokens(
+        self, input_batch: InputBatch, num_draft_tokens: int
+    ) -> None:
+        """set_draft_tokens for a batch without structured output requests,
+        from the draft count alone: that path reads only the tensor's width
+        (VLLM_C1AB_DEADLAUNCH)."""
+        assert not input_batch.has_structured_output_reqs
+        self.req_ids = input_batch.req_ids
+        self.num_draft_tokens = num_draft_tokens
+        self.draft_tokens_np = None
+
     def get_draft_tokens(self) -> DraftTokenIds | None:
         if self.draft_tokens_np is not None:
             self.copy_event.synchronize()
