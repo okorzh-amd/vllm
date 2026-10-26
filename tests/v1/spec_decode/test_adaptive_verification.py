@@ -64,6 +64,7 @@ def make_manager(
     manager.cost_tables = (np.zeros(num_reqs + 1), verify_cost_ms)
     manager._max_total_logits = 1 << 30
     manager.num_bonus_tokens = 1
+    manager._copy_admitted_drafts_to_host = False
     return manager
 
 
@@ -84,6 +85,7 @@ def test_tp_budget_uses_leader_despite_confidence_drift(
         )
         total = manager.get_num_tokens({"low": 2, "high": 2}, {"low": [1], "high": [2]})
         assert total == 2 + expected_budget
+        assert manager._batch_budget is not None
         assert manager._batch_budget[2] == expected_budget
 
 
@@ -93,14 +95,17 @@ def test_tp_reallocation_agrees_on_request_boundaries(
     monkeypatch, tp_group, tp_size, budget
 ):
     """Equal totals are insufficient: request/logit boundaries must also agree."""
+    # The Triton budget kernel needs a GPU; its reference does the same admits.
     monkeypatch.setattr(
         adaptive_module,
-        "_assign_draft_token_budget_compiled",
-        adaptive_module._assign_draft_token_budget,
+        "assign_draft_token_budget",
+        lambda probs, idx, caps, budget, _: caps.copy_(
+            global_topk_budget(probs, idx, caps.clone(), budget)
+        ),
     )
     monkeypatch.setattr(
         adaptive_module,
-        "async_copy_to_gpu",
+        "async_tensor_h2d",
         lambda array, *, out: out.copy_(torch.from_numpy(array)),
     )
     tp_group.world_size = tp_size
@@ -122,10 +127,12 @@ def test_tp_reallocation_agrees_on_request_boundaries(
         manager._num_non_draft_tokens = torch.empty(3, dtype=torch.int32)
         manager._cu_num_logits = torch.empty(4, dtype=torch.int32)
         manager.query_start_loc = torch.empty(6, dtype=torch.int32)
+        manager._draft_survival = None
 
-        logits, boundaries, actual_budget = manager.reallocate_drafts(
+        logits, boundaries, actual_budget, admitted = manager.reallocate_drafts(
             ["low", "high", "prefill"], torch.tensor([1, 0, 2])
         )
+        assert admitted is None
         capacities = torch.tensor(expected_capacities, dtype=torch.int32)
         assert actual_budget == budget
         assert torch.equal(manager._batch_draft_capacity, capacities)
