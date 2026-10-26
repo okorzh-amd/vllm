@@ -85,7 +85,7 @@ class Dims:
     tp: int
 
     def __post_init__(self):
-        assert self.tp in (2, 4), self.tp
+        assert self.tp in (2, 4, 8), self.tp
 
     @property
     def heads(self) -> int:
@@ -93,7 +93,13 @@ class Dims:
 
     @property
     def head_tiles(self) -> int:
-        return self.heads // HEAD_TILE
+        # TP8 tryout: 8 heads a rank take one MFMA tile, half of it padding
+        return -(-self.heads // HEAD_TILE)
+
+    @property
+    def heads_pad(self) -> int:
+        """The heads the split stage's LDS and MFMAs hold: whole head tiles."""
+        return self.head_tiles * HEAD_TILE
 
     @property
     def groups(self) -> int:
