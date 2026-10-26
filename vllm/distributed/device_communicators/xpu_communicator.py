@@ -237,7 +237,7 @@ class XpuCommunicator(DeviceCommunicatorBase):
         return output_tensor
 
     def broadcast(self, input_: torch.Tensor, src: int = 0) -> None:
-        dist.broadcast(input_, src=src, group=self.device_group)
+        dist.broadcast(input_, src=self.ranks[src], group=self.device_group)
 
     def dispatch_router_logits(
         self,

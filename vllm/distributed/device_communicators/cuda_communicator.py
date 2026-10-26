@@ -18,6 +18,7 @@ from vllm.distributed.device_communicators.pynccl_allocator import (
     is_symmetric_memory_enabled,
     is_symmetric_memory_tensor,
 )
+from vllm.distributed.device_communicators.pynccl_wrapper import ncclDataTypeEnum
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 
@@ -796,12 +797,19 @@ class CudaCommunicator(DeviceCommunicatorBase):
         if self.world_size == 1:
             return tensor
 
-        pynccl_comm = self.pynccl_comm
-        if pynccl_comm is not None and not pynccl_comm.disabled:
+        # Unlike c10d, PyNCCL neither rejects non-contiguous tensors nor maps
+        # every dtype (e.g. bool), so those keep using the device group.
+        pynccl_comm = getattr(self, "pynccl_comm", None)
+        if (
+            pynccl_comm is not None
+            and not pynccl_comm.disabled
+            and tensor.is_contiguous()
+            and ncclDataTypeEnum.try_from_torch(tensor.dtype) is not None
+        ):
             pynccl_comm.broadcast(tensor, src)
-            return tensor
         else:
-            raise ValueError("No PyNCCL communicator found")
+            torch.distributed.broadcast(tensor, self.ranks[src], self.device_group)
+        return tensor
 
     def destroy(self):
         if self.pynccl_comm is not None:

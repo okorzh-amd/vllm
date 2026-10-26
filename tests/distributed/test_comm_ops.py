@@ -13,6 +13,8 @@ from unittest.mock import Mock
 import pytest
 import ray
 import torch
+import torch.distributed as dist
+import torch.multiprocessing as mp
 
 from vllm.distributed import (
     broadcast_tensor_dict,
@@ -22,8 +24,13 @@ from vllm.distributed import (
     tensor_model_parallel_reduce_scatter,
 )
 from vllm.distributed.device_communicators import flashinfer_all_reduce
+from vllm.distributed.device_communicators.base_device_communicator import (
+    DeviceCommunicatorBase,
+)
 from vllm.distributed.device_communicators.cuda_communicator import CudaCommunicator
+from vllm.distributed.device_communicators.xpu_communicator import XpuCommunicator
 from vllm.distributed.parallel_state import GroupCoordinator, TensorMetadata
+from vllm.utils.network_utils import get_open_port
 from vllm.v1.worker.gpu_worker import AsyncIntermediateTensors
 
 from ..utils import (
@@ -557,6 +564,193 @@ def test_aiter_all_gather_precedes_pynccl(monkeypatch: pytest.MonkeyPatch) -> No
     monkeypatch.setattr(communicator, "_can_use_aiter_ag_rs", Mock(return_value=True))
 
     assert communicator.all_gatherv(torch.empty(1)) is output
+
+
+class _RecordingBroadcast:
+    """Stands in for torch.distributed.broadcast; records (src, group)."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[int, object]] = []
+
+    def __call__(self, tensor: torch.Tensor, src: int, group: Any = None) -> None:
+        self.calls.append((src, group))
+
+
+# The second group of a 4-rank world: group-local src 1 is global rank 3.
+_GROUP_RANKS = [2, 3]
+
+
+def test_group_broadcast_delegates_to_device_communicator(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Like send/recv, the coordinator lets the device communicator pick the
+    transport (PyNCCL on CUDA/ROCm) and passes the group-local src."""
+    monkeypatch.setattr(
+        torch.distributed, "broadcast", Mock(side_effect=AssertionError)
+    )
+    g = _make_group_for_unit_test(rank_in_group=0, world_size=2)
+    g.ranks = _GROUP_RANKS
+    g.device_communicator = Mock()
+    t = torch.arange(4)
+
+    assert g.broadcast(t, src=1) is t
+    g.device_communicator.broadcast.assert_called_once_with(t, 1)
+
+
+def test_group_broadcast_without_device_communicator_maps_src(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake = _RecordingBroadcast()
+    monkeypatch.setattr(torch.distributed, "broadcast", fake)
+    g = _make_group_for_unit_test(rank_in_group=0, world_size=2)
+    g.ranks = _GROUP_RANKS
+    g.device_group = object()
+    g.device_communicator = None
+    t = torch.arange(4)
+
+    assert g.broadcast(t, src=1) is t
+    assert fake.calls == [(3, g.device_group)]
+
+
+def test_group_broadcast_single_rank_is_noop(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        torch.distributed, "broadcast", Mock(side_effect=AssertionError)
+    )
+    g = _make_group_for_unit_test(rank_in_group=0, world_size=1)
+    g.device_communicator = Mock()
+    t = torch.arange(4)
+
+    assert g.broadcast(t) is t
+    g.device_communicator.broadcast.assert_not_called()
+
+
+def _cuda_communicator_for_broadcast(pynccl_comm: Mock | None) -> CudaCommunicator:
+    communicator = CudaCommunicator.__new__(CudaCommunicator)
+    communicator.world_size = 2
+    communicator.ranks = _GROUP_RANKS
+    communicator.device_group = object()
+    communicator.pynccl_comm = pynccl_comm
+    return communicator
+
+
+def test_cuda_communicator_broadcast_uses_pynccl(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        torch.distributed, "broadcast", Mock(side_effect=AssertionError)
+    )
+    pynccl_comm = Mock(disabled=False)
+    communicator = _cuda_communicator_for_broadcast(pynccl_comm)
+    t = torch.arange(4)
+
+    assert communicator.broadcast(t, src=1) is t
+    # PyNCCL ranks are group-local.
+    pynccl_comm.broadcast.assert_called_once_with(t, 1)
+
+
+@pytest.mark.parametrize("pynccl_state", ["missing", "disabled"])
+def test_cuda_communicator_broadcast_falls_back_to_device_group(
+    monkeypatch: pytest.MonkeyPatch, pynccl_state: str
+) -> None:
+    """VLLM_DISABLE_PYNCCL=1 (or no PyNCCL) falls back to torch.distributed."""
+    fake = _RecordingBroadcast()
+    monkeypatch.setattr(torch.distributed, "broadcast", fake)
+    pynccl_comm = None if pynccl_state == "missing" else Mock(disabled=True)
+    communicator = _cuda_communicator_for_broadcast(pynccl_comm)
+    t = torch.arange(4)
+
+    assert communicator.broadcast(t, src=1) is t
+    assert fake.calls == [(3, communicator.device_group)]
+    if pynccl_comm is not None:
+        pynccl_comm.broadcast.assert_not_called()
+
+
+@pytest.mark.parametrize("layout", ["non_contiguous", "bool"])
+def test_cuda_communicator_broadcast_keeps_c10d_for_unsupported_tensors(
+    monkeypatch: pytest.MonkeyPatch, layout: str
+) -> None:
+    """PyNCCL would silently mis-broadcast a strided view and rejects bool."""
+    fake = _RecordingBroadcast()
+    monkeypatch.setattr(torch.distributed, "broadcast", fake)
+    pynccl_comm = Mock(disabled=False)
+    communicator = _cuda_communicator_for_broadcast(pynccl_comm)
+    if layout == "non_contiguous":
+        t = torch.arange(12, dtype=torch.int32).reshape(3, 4)[:, :2]
+    else:
+        t = torch.ones(4, dtype=torch.bool)
+
+    assert communicator.broadcast(t, src=1) is t
+    assert fake.calls == [(3, communicator.device_group)]
+    pynccl_comm.broadcast.assert_not_called()
+
+
+def test_xpu_communicator_broadcast_maps_src_to_global_rank(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake = _RecordingBroadcast()
+    monkeypatch.setattr(torch.distributed, "broadcast", fake)
+    communicator = XpuCommunicator.__new__(XpuCommunicator)
+    communicator.ranks = _GROUP_RANKS
+    communicator.device_group = object()
+
+    communicator.broadcast(torch.arange(4), src=1)
+    assert fake.calls == [(3, communicator.device_group)]
+
+
+def _group_broadcast_worker(rank: int, world_size: int, port: int) -> None:
+    dist.init_process_group(
+        "gloo",
+        init_method=f"tcp://127.0.0.1:{port}",
+        rank=rank,
+        world_size=world_size,
+    )
+    from vllm.platforms import current_platform
+
+    # Any platform: exercise the platform-neutral communicator over gloo.
+    current_platform.get_device_communicator_cls = lambda: (  # type: ignore[method-assign]
+        "vllm.distributed.device_communicators.base_device_communicator."
+        "DeviceCommunicatorBase"
+    )
+    # Two groups, so the second one does not contain global rank 0.
+    half = world_size // 2
+    coord = GroupCoordinator(
+        group_ranks=[list(range(half)), list(range(half, world_size))],
+        local_rank=0,
+        torch_distributed_backend="gloo",
+        use_device_communicator=True,
+        group_name="broadcast_test",
+    )
+    communicator = coord.device_communicator
+    assert type(communicator) is DeviceCommunicatorBase
+    num_calls = 0
+    communicator_broadcast = communicator.broadcast
+
+    def counting_broadcast(tensor: torch.Tensor, src: int = 0) -> torch.Tensor:
+        nonlocal num_calls
+        num_calls += 1
+        return communicator_broadcast(tensor, src)
+
+    communicator.broadcast = counting_broadcast  # type: ignore[method-assign]
+
+    for src in range(coord.world_size):
+        t = torch.full((3,), 100 * rank, dtype=torch.int32)
+        assert coord.broadcast(t, src=src) is t
+        expected = torch.full((3,), 100 * coord.ranks[src], dtype=torch.int32)
+        torch.testing.assert_close(t, expected, rtol=0, atol=0)
+    assert num_calls == coord.world_size
+
+    coord.destroy()
+    dist.destroy_process_group()
+
+
+@pytest.mark.parametrize("world_size", [4, 6])
+def test_group_broadcast_through_device_communicator_gloo(world_size: int) -> None:
+    mp.spawn(
+        _group_broadcast_worker,
+        args=(world_size, get_open_port()),
+        nprocs=world_size,
+        join=True,
+    )
 
 
 def test_isend_object_posts_size_then_object_and_releases_on_wait(
