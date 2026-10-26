@@ -62,6 +62,9 @@ class MoeBuild:
     ug_groups: int = 2
     # a tuned build's paths (``layer.MonoBuild.tuned``)
     tuned: bool = False
+    # a generic build's batched X8 row copies and peer-base reloads
+    # (``layer.MonoBuild.x8r``, VLLM_C1AB_X8R)
+    x8r: bool = False
 
 
 @dataclass(frozen=True)
@@ -83,6 +86,7 @@ class RouteShape:
     # the target's (48 rows +3 us; the runners pick)
     ug_groups: int = 2
     tuned: bool = False  # ``MoeBuild.tuned``
+    x8r: bool = False  # ``MoeBuild.x8r``
 
     @property
     def dims(self) -> Dims:
@@ -145,8 +149,12 @@ class RouteShape:
     @property
     def shared_v2(self) -> bool:
         """Multi-task shared units and their L2 touch: a tuned build past one
-        token tile, ``SHARED_V2_MIN`` tokens on."""
-        return self.tuned and self.multi and self.tokens >= SHARED_V2_MIN
+        token tile, ``SHARED_V2_MIN`` tokens on. TP2 only: the threshold and
+        the unit size were measured there (a TP4 tuned build, VLLM_C1AB_TUNED_FFN,
+        keeps the one-task units)."""
+        return (
+            self.tuned and self.multi and self.tokens >= SHARED_V2_MIN and self.tp == 2
+        )
 
     @property
     def shared_stride(self) -> int:
@@ -272,5 +280,5 @@ class RouteShape:
 
 def route_shape(key: MoeBuild) -> RouteShape:
     return RouteShape(
-        key.experts, key.topk, key.tokens, key.tp, key.ug_groups, key.tuned
+        key.experts, key.topk, key.tokens, key.tp, key.ug_groups, key.tuned, key.x8r
     )

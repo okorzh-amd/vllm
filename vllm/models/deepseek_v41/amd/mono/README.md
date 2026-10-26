@@ -38,6 +38,17 @@ new, reading vLLM's KV records and weights as loaded.
   `MonoBuild.generic` (a `DSV41MonoLayer(generic=True)` runner) compiles the
   generic code for those layers too: the reference that
   `test_mono_tuned_builds_match_generic` compares them with, bit for bit.
+- C1AB A/B switches (environment, read once a runner; unset: the builds
+  above, unchanged): `VLLM_C1AB_TUNED_FRONT=1` compiles K1's tuned paths
+  (`MonoBuild.tuned_front`) at TP4, every ratio, the DSpark draft's K1 too;
+  `VLLM_C1AB_TUNED_FFN=1` compiles K2's (`MonoBuild.tuned_k2`: the attention
+  back, the FFN seam and the MoE, with their scratch and peer layouts) at
+  TP4, every ratio, target layers only, with the TP2-measured 30+ row paths
+  (two-task shared units, per-tile wo_a flags) off and the split-down cap
+  taken from TP2's LDS words; `VLLM_C1AB_X8R=1` gives a generic TP4 K2 the
+  batched X8 row copies (the shared expert's, one token tile; the routed
+  X8R gather is unchanged) and loads the MoE push's peer bases ahead of the
+  push (`MonoBuild.x8r`: no VGPR spill at 14 rows).
 - Contract: a drop-in for `DeepseekV4DecoderLayer.forward`:
   in  `x` (the previous FFN output, reduced, bf16 [M, 5120]), `residual`
       (bf16 [M, 4, 5120]), `post_mix` [M, 4, 1], `res_mix` [M, 4, 4],

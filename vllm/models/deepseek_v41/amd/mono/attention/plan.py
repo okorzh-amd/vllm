@@ -58,10 +58,13 @@ CRDY_COPIES = 8
 ARDY_MIN_S = 30
 
 
-def ardy_tiles(s: int, tuned: bool = False) -> int:
-    """Token tiles wo_a publishes flags for (1: one flag a task)."""
+def ardy_tiles(s: int, tuned: bool = False, tp: int = 2) -> int:
+    """Token tiles wo_a publishes flags for (1: one flag a task). TP2 only:
+    ARDY_MIN_S was measured there (a TP4 tuned build, VLLM_C1AB_TUNED_FFN,
+    keeps one flag a task)."""
     nt = len(token_tiles(s))
-    return nt if tuned and nt > 1 and s >= ARDY_MIN_S and s % TILE != 0 else 1
+    per_tile = tuned and tp == 2 and nt > 1 and s >= ARDY_MIN_S
+    return nt if per_tile and s % TILE != 0 else 1
 
 
 def flag_stride(n: int) -> int:
@@ -202,7 +205,7 @@ def back_scratch(s: int, d: Dims, start: int = 0, tuned: bool = False) -> dict:
             ("x8bs", s * d.o_rows // 32 * 4),
             (
                 "ardy",
-                (ARDY_COPIES * ardy_tiles(s, True) if tuned else 1)
+                (ARDY_COPIES * ardy_tiles(s, True, d.tp) if tuned else 1)
                 * d.woa_tasks
                 * PAIR,
             ),

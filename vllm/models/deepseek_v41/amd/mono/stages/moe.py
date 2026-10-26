@@ -106,7 +106,7 @@ from vllm.models.deepseek_v41.amd.mono.common.plan import (
 )
 from vllm.models.deepseek_v41.amd.mono.common.sync import preg, publish, sreg
 from vllm.models.deepseek_v41.amd.mono.stages import moe_plan as mplan
-from vllm.models.deepseek_v41.amd.mono.stages.dims import UG_PART
+from vllm.models.deepseek_v41.amd.mono.stages.dims import UG_PART, Dims
 
 # helpers the kernel calls are imported by name: FlyDSL keys a build by the
 # source of the same-directory functions it names, never through a module
@@ -1206,7 +1206,8 @@ def load_x8_rows(c, words_mb, codes_mb, xl, xsl, token_of, live, batch=False):
         c["poll"]([(c["x8rdy"], token_of(fx.min(tid, live - 1)), 1)])
     gpu.barrier()
     tuned = c["rs"].tuned
-    if const_expr(tuned and (isinstance(live, int) or batch)):
+    # VLLM_C1AB_X8R (``RouteShape.x8r``): a generic build's copies batched too
+    if const_expr((tuned or c["rs"].x8r) and (isinstance(live, int) or batch)):
         load_x8_rows_all(c, words_mb, codes_mb, xl, xsl, token_of, live)
         gpu.barrier()
         return
@@ -1740,10 +1741,17 @@ def stage_down(c, tasks):
         down_rounds_pipe(c, tasks, nu, sl, sw, slots, per_round)
     else:
         down_rounds(c, tasks, nu, sl, sw, slots, per_round)
+    if const_expr(c["rs"].x8r):
+        # every push's peer bases in flight before the first push (generic
+        # builds, ``run_ffn``'s ``moe_peer``): a reload behind a push would
+        # wait for its xGMI write to complete
+        c["pbs"] = [c["peer_addr"](p) for p in range(d.tp)]
     gpu.barrier()
     for t0, nn in token_tiles(s):
         for j in range_constexpr(n):
             down_combine(c, tasks[j], j, t0, nn)
+    if const_expr(c["rs"].x8r):
+        c["pbs"] = None
 
 
 @traced
@@ -2552,6 +2560,8 @@ def down_combine(c, task, j, t0, n):
             routed = bf16_round(routed + vw)
         fx.ptr_store(bf16_round(routed + shared), c["pair"] + tid)
     gpu.barrier()
+    # the peer bases ``stage_down`` loaded ahead (``RouteShape.x8r``), or None
+    pbs = c.get("pbs")
     if const_expr(tuned):
         ffn_push(c, task, t0, n)
     elif tid < ROWS * n // 2:
@@ -2562,7 +2572,9 @@ def down_combine(c, task, j, t0, n):
         v1 = fx.ptr_load(c["pair"] + (tl * ROWS + 2 * rp + 1))
         col = task * ROWS + 2 * rp
         for p in range_constexpr(d.tp):
-            dst = preg(c["peer_addr"](p), c["ffn_off"], "ffn")
+            dst = preg(
+                c["peer_addr"](p) if pbs is None else pbs[p], c["ffn_off"], "ffn"
+            )
             c["put_bf"](dst, 2 * region_pair(c["rank"], t, s, col), [v0, v1])
     gpu.barrier()
 
@@ -2844,8 +2856,14 @@ def moe_smem(s, rs, timeline):
 
 def down_lds_mid(rs) -> bool:
     """Whether the down stage copies its picks' MID rows into LDS and splits
-    the extra down tiles (``stage_down_split``)."""
-    return rs.tuned and rs.picks <= DOWN_LDS_PICKS
+    the extra down tiles (``stage_down_split``). Past TP2 (a TP4 tuned build,
+    VLLM_C1AB_TUNED_FFN) the cap is TP2's LDS words, not its picks: a TP4
+    pick's MID / MIDS rows are 180 words, not 324, so 129 picks fit."""
+    if not rs.tuned:
+        return False
+    if rs.tp == 2:
+        return rs.picks <= DOWN_LDS_PICKS
+    return sum(_lds_mid_words(rs.dims, rs.picks)) <= DOWN_LDS_WORDS
 
 
 def down_pipe(rs) -> bool:
@@ -2860,12 +2878,20 @@ def pipe_mids_words(rs, p):
     return -(-p * (d.inter // 32) // 4) * 4
 
 
+def _lds_mid_words(d, picks):
+    """The LDS words of ``picks`` MID rows and of their MIDS codes."""
+    return picks * d.mid_words, -(-picks * (d.inter // 32) // 4) * 4
+
+
+# ``down_lds_mid``'s cap past TP2: TP2's DOWN_LDS_PICKS picks' words
+DOWN_LDS_WORDS = sum(_lds_mid_words(Dims(2), DOWN_LDS_PICKS))
+
+
 def down_lds_mid_words(rs):
     """The LDS words of every pick's MID and MIDS rows (``mid_rows_to_lds``)."""
     if not down_lds_mid(rs):
         return 0, 0
-    d = rs.dims
-    return rs.picks * d.mid_words, -(-rs.picks * (d.inter // 32) // 4) * 4
+    return _lds_mid_words(rs.dims, rs.picks)
 
 
 def stage_lds(s, rs):

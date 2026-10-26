@@ -36,6 +36,7 @@ from .layer import (
     build_mono_k2,
     peer_half_bytes,
     scratch_bytes,
+    scratch_layout,
 )
 from .stages.dims import Dims as MoeDims
 from .stages.moe_shape import EXPERTS, TOPK
@@ -43,6 +44,20 @@ from .stages.moe_shape import EXPERTS, TOPK
 __all__ = ["BLOCKS", "MAX_TOKENS", "AttnWeights", "DSV41MonoLayer", "MonoLayerWeights"]
 
 _LOG2E = 1.4426950408889634
+
+# The C1AB A/B switches (``layer.MonoBuild.c1ab_*``), read once a runner.
+C1AB_FLAGS = {
+    "front": "VLLM_C1AB_TUNED_FRONT",
+    "ffn": "VLLM_C1AB_TUNED_FFN",
+    "x8r": "VLLM_C1AB_X8R",
+}
+
+
+def c1ab_flags() -> dict[str, bool]:
+    """The C1AB switches from the environment ('1': on; unset: all off)."""
+    return {k: os.environ.get(v, "0") == "1" for k, v in C1AB_FLAGS.items()}
+
+
 HC = 4
 
 
@@ -195,6 +210,7 @@ class DSV41MonoLayer:
         ug_groups: int = 2,
         swa_width: int = WINDOW,
         generic: bool = False,
+        c1ab: dict[str, bool] | None = None,
     ):
         _ensure_writable_flydsl_cache()
         from .common.peer_memory import PeerBuffer
@@ -216,9 +232,27 @@ class DSV41MonoLayer:
         self.swa_width = swa_width
         # every build generic (``MonoBuild.generic``): the tuned builds' reference
         self.generic = generic
+        # the C1AB A/B switches of every build (``c1ab_flags``; ``c1ab``: given,
+        # e.g. by a test); a generic runner's builds ignore them
+        src = c1ab_flags() if c1ab is None else c1ab
+        assert set(src) <= set(C1AB_FLAGS), src
+        self.c1ab = {k: bool(src.get(k, False)) for k in C1AB_FLAGS}
+        if any(self.c1ab.values()) and not generic:
+            from vllm.logger import init_logger
+
+            init_logger(__name__).info(
+                "DSv4.1 mono C1AB switches (tp %d, %d experts): %s; tuned K1 at "
+                "ratio 0/1/2: %s, tuned K2: %s, X8R: %s",
+                tp,
+                experts,
+                self.c1ab,
+                [self.build_key(1, r).tuned_front for r in (0, 1, 2)],
+                [self.build_key(1, r).tuned_k2 for r in (0, 1, 2)],
+                [self.build_key(1, r).x8r for r in (0, 1, 2)],
+            )
         self.d = Dims(tp)
         dev = self.device = torch.device(device)
-        self._scratch: dict[tuple[int, bool], torch.Tensor] = {}
+        self._scratch: dict[tuple, torch.Tensor] = {}
         # [epoch, -, -, -, a mark per CTA, the MoE's counters]
         self.epoch = torch.zeros(EPOCH_WORDS, dtype=torch.int32, device=dev)
         self.q = torch.zeros(
@@ -241,10 +275,11 @@ class DSV41MonoLayer:
         self.post_a = torch.zeros(MAX_TOKENS, HC, dtype=torch.float32, device=dev)
         self.comb_a = torch.zeros(MAX_TOKENS, HC, HC, dtype=torch.float32, device=dev)
         self.pre_a = torch.zeros(MAX_TOKENS, HC, dtype=torch.float32, device=dev)
-        # A tuned build (``MonoBuild.tuned``) packs its peer regions its own
-        # way: it takes two parities of its own past the generic builds' two.
+        # A tuned build (``MonoBuild.tuned``; its K2, ``MonoBuild.tuned_k2``)
+        # packs its peer regions its own way: it takes two parities of its own
+        # past the generic builds' two.
         half = peer_half_bytes(tp)
-        tuned = self.build_key(1, 2).tuned
+        tuned = any(self.build_key(1, r).tuned_k2 for r in (0, 1, 2))
         self.peer = PeerBuffer((4 if tuned else 2) * half, group, rank, tp, dev)
         self.peer.bytes.zero_()
         self._peers = {False: (self.peer.local, self.peer.addresses)}
@@ -260,12 +295,18 @@ class DSV41MonoLayer:
         )
         self._kernels: dict = {}
 
-    def scratch(self, tokens: int, tuned: bool = False) -> torch.Tensor:
+    def scratch(
+        self, tokens: int, tuned: bool = False, front: bool | None = None
+    ) -> torch.Tensor:
         """Step width ``tokens``'s scratch: a width's layout has memory of its own
-        (``layer.scratch_layout``), and so has a tuned build's. Allocated at the
-        width's first step, which is eager: vLLM runs every graph's batch
-        eagerly before capturing it."""
-        buf = self._scratch.get((tokens, tuned))
+        (``layer.scratch_layout``), and so has a tuned build's (``front``: K1's
+        regions tuned, None: as ``tuned``). Allocated at the width's first
+        step, which is eager: vLLM runs every graph's batch eagerly before
+        capturing it."""
+        if front is None:
+            front = tuned
+        key = (tokens, tuned) if front == tuned else (tokens, tuned, front)
+        buf = self._scratch.get(key)
         if buf is None:
             if torch.cuda.is_current_stream_capturing():
                 raise RuntimeError(
@@ -274,13 +315,34 @@ class DSV41MonoLayer:
                 )
             buf = torch.zeros(
                 scratch_bytes(
-                    tokens, self.tp, self.experts, self.topk, self.ug_groups, tuned
+                    tokens,
+                    self.tp,
+                    self.experts,
+                    self.topk,
+                    self.ug_groups,
+                    tuned,
+                    front,
                 ),
                 dtype=torch.uint8,
                 device=self.device,
             )
-            self._scratch[(tokens, tuned)] = buf
+            self._scratch[key] = buf
         return buf
+
+    def step_scratch(self, tokens: int, ratio: int) -> tuple[torch.Tensor, dict]:
+        """The scratch a step of ``tokens`` rows of a ratio-``ratio`` layer runs
+        on, and its layout (``layer.scratch_layout``)."""
+        b = self.build_key(tokens, ratio)
+        layout = scratch_layout(
+            tokens,
+            self.tp,
+            self.experts,
+            self.topk,
+            self.ug_groups,
+            b.tuned_k2,
+            b.tuned_front,
+        )
+        return self.scratch(tokens, b.tuned_k2, b.tuned_front), layout
 
     def first_pre_mix(self, tokens: int) -> torch.Tensor:
         return self._first_pre[:tokens]
@@ -305,6 +367,9 @@ class DSV41MonoLayer:
             ug_groups=self.ug_groups,
             swa_width=self.swa_width,
             generic=self.generic,
+            c1ab_front=self.c1ab["front"],
+            c1ab_ffn=self.c1ab["ffn"],
+            c1ab_x8r=self.c1ab["x8r"],
         )
 
     def kernels(self, tokens: int, ratio: int, fold: bool = True, index: bool = False):
@@ -377,9 +442,9 @@ class DSV41MonoLayer:
         index = select is not None
         assert not index or ratio
         k1, k2 = self.kernels(M, ratio, fold, index)
-        tuned = self.build_key(M, ratio).tuned
-        scratch = self.scratch(M, tuned)
-        sym, peers = self._peers[tuned]
+        b = self.build_key(M, ratio)
+        scratch = self.scratch(M, b.tuned_k2, b.tuned_front)
+        sym, peers = self._peers[b.tuned_k2]
         st = torch.cuda.current_stream()
         if outs is None:
             outs = self._outs(M, residual)

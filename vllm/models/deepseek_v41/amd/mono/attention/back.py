@@ -1103,7 +1103,7 @@ def run_back(c, key, bid):
     # Tuned at some widths (``plan.ardy_tiles``): a tile once its own tokens'
     # XO is in, its ready flags published at its end, wo_b taking a tile once
     # every wo_a task published it.
-    ntiles = ardy_tiles(s, c["tuned"])
+    ntiles = ardy_tiles(s, c["tuned"], key.tp)
     per_tile = ntiles > 1
     if has_woa:
         grp = woa_t // (woa_tasks // groups)
