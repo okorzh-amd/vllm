@@ -121,8 +121,8 @@ class MonoBuild:
 
     @property
     def _c1ab(self) -> bool:
-        """A build the C1AB switches may widen: gfx950, TP4, not generic."""
-        return not GFX942 and not self.generic and self.tp == 4
+        """A build the C1AB switches may widen: gfx950, TP4 or TP8, not generic."""
+        return not GFX942 and not self.generic and self.tp in (4, 8)
 
     @property
     def tuned_front(self) -> bool:

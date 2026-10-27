@@ -55,7 +55,7 @@ from vllm.models.deepseek_v41.amd.mono.common.plan import (
     cdiv,
     pair_layout,
 )
-from vllm.models.deepseek_v41.amd.mono.common.sync import preg
+from vllm.models.deepseek_v41.amd.mono.common.sync import POLL_MAX, preg
 from vllm.models.deepseek_v41.amd.mono.stages.gemv import (
     TILE,
     ld_bf,
@@ -171,7 +171,9 @@ def attn_words(c, own, t, col, nw):
             specs.append(
                 (own, attn_unit(src, tile, units, wt, fs[e] // UNIT_WORDS, tp))
             )
-    vs = c["poll_units"](specs)
+    # one batch at every TP: TP8's 8 ranks x 2 words exceed POLL_MAX, and a
+    # split batch is two serial round trips (TP2/TP4 stay at POLL_MAX)
+    vs = c["poll_units"](specs, batch=max(POLL_MAX, len(specs)))
     return [
         [_pick3(vs[src * nw + e], fs[e] % UNIT_WORDS) for e in range(nw)]
         for src in range(tp)
